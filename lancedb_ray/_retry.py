@@ -1,0 +1,140 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Retry helpers for transient LanceDB failures.
+
+Remote (Cloud/Enterprise) calls go over HTTP and fail transiently; local writes
+contend on the dataset commit lock. Both are worth retrying with backoff, and
+neither should be retried forever.
+"""
+
+from __future__ import annotations
+
+import logging
+import random
+import time
+from collections.abc import Callable
+from typing import TypeVar
+
+logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
+
+__all__ = ["RetryPolicy", "call_with_retry", "is_commit_conflict", "is_transient"]
+
+# Substrings identifying errors that are worth another attempt. Matched against
+# the lowercased ``str()`` of the exception because the LanceDB Python SDK
+# surfaces server-side failures as generic exception types with descriptive
+# messages rather than a dedicated exception hierarchy.
+_TRANSIENT_MARKERS = (
+    "timeout",
+    "timed out",
+    "connection reset",
+    "connection aborted",
+    "connection refused",
+    "broken pipe",
+    "temporarily unavailable",
+    "service unavailable",
+    "too many requests",
+    "internal server error",
+    "bad gateway",
+    "gateway timeout",
+    "502",
+    "503",
+    "504",
+    "429",
+)
+
+_COMMIT_CONFLICT_MARKERS = (
+    "commit conflict",
+    "concurrent",
+    "version already exists",
+    "retryable commit",
+    "commit was rejected",
+)
+
+
+def is_transient(error: BaseException) -> bool:
+    """Return whether ``error`` looks like a retryable transient failure."""
+    message = str(error).lower()
+    return any(marker in message for marker in _TRANSIENT_MARKERS)
+
+
+def is_commit_conflict(error: BaseException) -> bool:
+    """Return whether ``error`` looks like a losing race on a dataset commit."""
+    message = str(error).lower()
+    return any(marker in message for marker in _COMMIT_CONFLICT_MARKERS)
+
+
+class RetryPolicy:
+    """Exponential backoff with full jitter.
+
+    Args:
+        max_attempts: Total attempts including the first. ``1`` disables retrying.
+        initial_backoff_s: Backoff before the second attempt.
+        max_backoff_s: Ceiling on the backoff between attempts.
+        predicate: Returns whether a given exception should be retried.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_attempts: int = 5,
+        initial_backoff_s: float = 0.5,
+        max_backoff_s: float = 32.0,
+        predicate: Callable[[BaseException], bool] = is_transient,
+    ) -> None:
+        if max_attempts < 1:
+            raise ValueError(f"max_attempts must be at least 1, got {max_attempts}")
+        self.max_attempts = max_attempts
+        self.initial_backoff_s = initial_backoff_s
+        self.max_backoff_s = max_backoff_s
+        self.predicate = predicate
+
+    def backoff_for(self, attempt: int) -> float:
+        """Return the sleep, in seconds, before attempt number ``attempt`` (1-based)."""
+        uncapped = self.initial_backoff_s * (2 ** (attempt - 1))
+        return random.uniform(0.0, min(uncapped, self.max_backoff_s))
+
+
+def call_with_retry(
+    fn: Callable[[], T],
+    policy: RetryPolicy,
+    *,
+    description: str,
+    sleep: Callable[[float], None] = time.sleep,
+) -> T:
+    """Call ``fn``, retrying while ``policy.predicate`` accepts the raised error.
+
+    Args:
+        fn: Zero-argument callable to invoke.
+        policy: Attempt count, backoff schedule and retry predicate.
+        description: Human-readable operation name used in log messages.
+        sleep: Injectable sleep, so tests do not spend real time backing off.
+
+    Returns:
+        Whatever ``fn`` returns on its first successful attempt.
+
+    Raises:
+        BaseException: The final error, once attempts are exhausted or the
+            predicate rejects it.
+    """
+    last_error: BaseException | None = None
+    for attempt in range(1, policy.max_attempts + 1):
+        try:
+            return fn()
+        except Exception as error:  # noqa: BLE001 - re-raised below
+            last_error = error
+            if attempt == policy.max_attempts or not policy.predicate(error):
+                raise
+            backoff = policy.backoff_for(attempt)
+            logger.warning(
+                "%s failed (attempt %d/%d): %s. Retrying in %.2fs.",
+                description,
+                attempt,
+                policy.max_attempts,
+                error,
+                backoff,
+            )
+            sleep(backoff)
+
+    # Unreachable: the loop either returns or raises.
+    raise AssertionError(f"retry loop exited without result: {last_error}")

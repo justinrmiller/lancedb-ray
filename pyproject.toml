@@ -1,0 +1,86 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lancedb-ray"
+version = "0.1.0"
+description = "Ray Data integration for LanceDB and LanceDB Enterprise"
+readme = "README.md"
+requires-python = ">=3.10,<3.14"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Justin Miller" }]
+keywords = ["ray", "lancedb", "lance", "vector-database", "distributed"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+
+dependencies = [
+    "ray[data]>=2.41.0",
+    "lancedb>=0.24.0",
+    "lance-ray>=0.5.0",
+    "pyarrow>=17.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.4.0",
+    "pytest-cov>=5.0.0",
+    "pytest-xdist>=3.6.0",
+    "mypy>=1.11.0",
+    "ruff>=0.8.0",
+    "pandas>=2.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/justinrmiller/lancedb-ray"
+Repository = "https://github.com/justinrmiller/lancedb-ray"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["lancedb_ray*"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+src = ["lancedb_ray", "tests", "examples"]
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "UP", "SIM"]
+ignore = ["E501", "UP045", "UP007"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["--cov=lancedb_ray", "--cov-report=term-missing", "--cov-fail-under=90"]
+markers = [
+    "enterprise: live tests against a real LanceDB Cloud/Enterprise endpoint (needs LANCEDB_URI + LANCEDB_API_KEY)",
+]
+
+[tool.coverage.run]
+source = ["lancedb_ray"]
+omit = ["*/tests/*"]
+
+[tool.mypy]
+# No python_version pin: it must match the interpreter actually running mypy,
+# because some installed stubs (numpy) use syntax newer than our floor.
+# Ruff's target-version = "py310" is what enforces the language floor.
+files = ["lancedb_ray", "tests", "examples"]
+# Test helpers are imported flat (not as tests.*) so Ray workers can load them.
+mypy_path = "tests"
+strict = true
+warn_unused_ignores = false
+
+[[tool.mypy.overrides]]
+module = ["lancedb.*", "lance.*", "lance_ray.*", "ray.*", "pyarrow.*", "pandas.*"]
+ignore_missing_imports = true
