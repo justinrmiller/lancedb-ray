@@ -10,6 +10,11 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # Ray's uv runtime-env hook probes the process tree, which fails on hosted
+  # runners; the integration does not need it.
+  RAY_ENABLE_UV_RUN_RUNTIME_ENV: "0"
+
 jobs:
   lint:
     runs-on: ubuntu-latest
@@ -18,10 +23,12 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
-      - name: Set up Python
-        run: uv python install 3.12
+      - name: Create environment
+        run: |
+          uv venv --python 3.12
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
       - name: Install
-        run: uv pip install --system -e ".[dev]"
+        run: uv pip install -e ".[dev]"
       - name: Ruff check
         run: ruff check .
       - name: Ruff format
@@ -40,12 +47,12 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
-      - name: Set up Python ${{ matrix.python-version }}
-        run: uv python install ${{ matrix.python-version }}
+      - name: Create environment
+        run: |
+          uv venv --python ${{ matrix.python-version }}
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
       - name: Install
-        run: uv pip install --system -e ".[dev]"
+        run: uv pip install -e ".[dev]"
       - name: Test
         # Live Enterprise tests skip automatically without credentials.
         run: pytest -v
-        env:
-          RAY_ENABLE_UV_RUN_RUNTIME_ENV: "0"
