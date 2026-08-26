@@ -1,0 +1,22 @@
+# Local S3-compatible object storage for testing lancedb-ray writes.
+#
+#   docker compose -f examples/object_storage/docker-compose.yml up -d
+#
+# Floci is an AWS emulator: S3 speaks the real wire protocol on :4566 and
+# accepts any credentials, so a write that works here uses the same code path
+# as a write to real S3 -- object_store, multipart uploads and all.
+services:
+  floci:
+    image: floci/floci:latest
+    container_name: lancedb-ray-floci
+    ports:
+      - "4566:4566"
+    volumes:
+      # Object data survives `down`/`up`; delete ./data to start clean.
+      - ./data:/app/data
+    healthcheck:
+      # The S3 service answers ListBuckets at the root once it is ready.
+      test: ["CMD-SHELL", "curl -fsS http://localhost:4566/ >/dev/null || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
