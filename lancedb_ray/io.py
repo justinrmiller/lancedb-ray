@@ -41,6 +41,9 @@ __all__ = ["read_lancedb", "write_lancedb"]
 
 LocalWriteStrategy = Literal["auto", "fragment", "api"]
 
+#: Block count used to hash-partition an upsert when nothing better is known.
+_DEFAULT_UPSERT_PARTITIONS = 16
+
 
 def _build_spec(
     uri: str,
@@ -79,7 +82,7 @@ def read_lancedb(
     filter: Optional[str] = None,
     version: Optional[Union[int, str]] = None,
     remote_read_strategy: RemoteReadStrategy = "auto",
-    batch_size: int = 10_000,
+    batch_size: int = 50_000,
     ray_remote_args: Optional[dict[str, Any]] = None,
     concurrency: Optional[int] = None,
     override_num_blocks: Optional[int] = None,
@@ -225,10 +228,12 @@ def write_lancedb(
     namespace_client_properties: Optional[Mapping[str, Any]] = None,
     mode: WriteMode = "append",
     on: Optional[Union[str, list[str]]] = None,
+    partition_on_keys: bool = True,
     schema: Optional[pa.Schema] = None,
     transform_fn: Optional[TransformFn] = None,
-    min_rows_per_write: int = 1024,
-    max_rows_per_request: int = 65_536,
+    rows_per_transaction: int = 256 * 1024,
+    max_rows_per_request: Optional[int] = None,
+    write_parallelism: Optional[int] = None,
     when_matched_update_all: bool = True,
     when_not_matched_insert_all: bool = True,
     when_not_matched_by_source_delete: Union[bool, str] = False,
@@ -272,6 +277,13 @@ def write_lancedb(
         namespace_client_properties: Properties for the namespace implementation.
         mode: ``create``, ``append``, ``overwrite`` or ``upsert``.
         on: Key column(s) to match on. Required when ``mode="upsert"``.
+        partition_on_keys: For upserts, hash-partition the input on ``on``
+            first so all rows for a key land in one write task. This costs a
+            shuffle. It changes nothing when the source's keys are already
+            unique -- a unique key can only occupy one block -- but when the
+            source repeats a key it turns silent cross-task duplication into
+            LanceDB's explicit ambiguous-merge error. Disable only when you
+            know the keys are unique and want to skip the shuffle.
         schema: Schema used when creating the table. Defaults to the dataset's.
         transform_fn: Optional per-batch transform applied before writing.
             Only supported on the API write path; requesting it for a local
@@ -314,13 +326,23 @@ def write_lancedb(
     # Validate here rather than relying on the datasink: the fragment path does
     # not construct a datasink at all, so it would otherwise accept a bad mode
     # and fail much later with a confusing storage-level error.
-    validate_write_args(mode, on)
+    normalized_on = validate_write_args(mode, on)
 
-    use_fragment_path = _should_use_fragment_path(
-        spec, mode, local_write_strategy, transform_fn
-    )
+    if mode == "upsert" and partition_on_keys:
+        # Two tasks each holding one row for the same key will each find the
+        # key absent and each insert it -- silently duplicating it, since
+        # neither source is internally ambiguous. Hash-partitioning on the key
+        # columns puts every row for a key in one task, where LanceDB rejects
+        # the ambiguity outright instead. A loud error beats corrupt data.
+        ds = _hash_partition(ds, normalized_on, concurrency)
+
+    use_fragment_path = _should_use_fragment_path(spec, mode, local_write_strategy)
 
     if use_fragment_path:
+        if transform_fn is not None:
+            # Run the transform as its own Ray stage rather than inside the
+            # sink, so the write itself still takes the single-commit path.
+            ds = ds.map_batches(transform_fn, batch_format="pyarrow")
         _write_local_fragments(
             ds,
             spec,
@@ -335,9 +357,9 @@ def write_lancedb(
         return
 
     if concurrency is None and not spec.is_remote and mode == "upsert":
-        # Concurrent merge-insert against one local dataset contends on the
-        # commit lock; every loser retries. Cap it rather than let the job
-        # thrash. Remote upserts have no such limit -- the service serialises.
+        # Hash partitioning already rules out same-key races; this cap is purely
+        # about commit-lock contention on a single local dataset. Remote upserts
+        # have no such limit -- the service serialises for us.
         concurrency = 4
 
     datasink = LanceDBDatasink(
@@ -348,8 +370,9 @@ def write_lancedb(
         # When schema is None, Ray hands the datasink the input schema in
         # on_write_start, so there is no need to materialise it here.
         schema=schema,
-        min_rows_per_write=min_rows_per_write,
+        rows_per_transaction=rows_per_transaction,
         max_rows_per_request=max_rows_per_request,
+        write_parallelism=write_parallelism,
         transform_fn=transform_fn,
         when_matched_update_all=when_matched_update_all,
         when_not_matched_insert_all=when_not_matched_insert_all,
@@ -362,18 +385,43 @@ def write_lancedb(
     )
 
 
+def _hash_partition(
+    ds: Dataset, keys: Optional[list[str]], concurrency: Optional[int]
+) -> Dataset:
+    """Co-locate every row sharing a key in the same block.
+
+    Without this, two write tasks holding the same key can both observe it as
+    absent and both insert it. Repartitioning by the merge keys makes that
+    impossible by construction rather than relying on the backend to detect
+    the conflict.
+    """
+    if not keys:
+        return ds
+
+    num_blocks = concurrency if concurrency and concurrency > 0 else None
+    if num_blocks is None:
+        try:
+            num_blocks = ds.num_blocks()
+        except Exception:  # noqa: BLE001 - lazy datasets cannot report this
+            # num_blocks() raises unless the dataset is materialised, and
+            # materialising just to count is not worth it. Ray will still
+            # hash-partition correctly with a nominal block count.
+            num_blocks = _DEFAULT_UPSERT_PARTITIONS
+    if not num_blocks or num_blocks < 1:
+        num_blocks = 1
+    return ds.repartition(num_blocks, keys=keys)
+
+
 def _should_use_fragment_path(
     spec: LanceDBConnectionSpec,
     mode: WriteMode,
     local_write_strategy: LocalWriteStrategy,
-    transform_fn: Optional[TransformFn],
 ) -> bool:
     """Decide whether a write can take the distributed fragment path.
 
     The fragment path writes raw Lance fragments and commits them in one
     transaction. That is only meaningful for local tables doing whole-row
-    appends -- it cannot express upsert semantics, and it bypasses the
-    per-batch hook that ``transform_fn`` relies on.
+    appends -- it cannot express upsert semantics.
     """
     if local_write_strategy == "api":
         return False
@@ -386,8 +434,6 @@ def _should_use_fragment_path(
         )
     if mode == "upsert":
         blockers.append("upsert requires row matching, which fragment writes cannot do")
-    if transform_fn is not None:
-        blockers.append("transform_fn is only applied on the table API path")
 
     if not blockers:
         return True

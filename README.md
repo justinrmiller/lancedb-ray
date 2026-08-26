@@ -90,24 +90,87 @@ Requires Python 3.10–3.13.
 | --- | --- |
 | `mode` | `create`, `append`, `overwrite`, `upsert` |
 | `on` | Key column(s) to match on — required for `upsert` |
+| `partition_on_keys` | Hash-partition on `on` before an upsert (default `True`) |
 | `transform_fn` | Per-batch transform applied before writing (e.g. computing embeddings) |
 | `on_batch_error` | `raise` (default) or `skip` |
 | `local_write_strategy` | `auto` (default), `fragment`, `api` |
-| `min_rows_per_write`, `max_rows_per_request` | Request sizing on the API path |
+| `rows_per_transaction` | Rows Ray bundles per write task = transaction size |
+| `max_rows_per_request` | Optional memory ceiling; splits a task into several transactions |
+| `write_parallelism` | Parts the client uploads concurrently within one transaction |
 | `when_matched_update_all`, `when_not_matched_insert_all`, `when_not_matched_by_source_delete` | Merge-insert semantics |
 
-## Notes and trade-offs
+## Two traps this library avoids
 
-- **`on_batch_error` defaults to `raise`.** Logging a failed batch and continuing lets a
-  write job report success while having silently lost data. `skip` is available when
-  partial completion genuinely is preferable, and dropped rows are counted and warned about.
+These are easy to get wrong when writing to LanceDB from a distributed engine, and both
+were worth designing around explicitly.
+
+### One transaction per task, not one per batch
+
+Every LanceDB write is a transaction: it produces a new table version and at least one
+fragment. The obvious way to write a Ray Dataset — issue a write per incoming batch —
+therefore multiplies both. Measured on a 20,480-row append:
+
+| Approach | Versions | Fragments |
+| --- | ---: | ---: |
+| One write per 1,024-row batch | 21 | 20 |
+| One write for the whole task | 2 | 1 |
+
+Thousands of tiny fragments degrade read performance until compaction catches up, and
+against Cloud/Enterprise the extra requests burn quota and invite rate limiting.
+
+So a write task hands **all** of its rows to LanceDB as a single `RecordBatchReader`. The
+client streams that to the service as multiple parts under one upload and commits once, so
+one task is one transaction no matter how many blocks Ray delivered. `rows_per_transaction`
+controls how many rows Ray bundles per task, and therefore how large each transaction is.
+
+Local append-style writes skip this path entirely — they write Lance fragments in parallel
+and commit them in a single transaction, so the table advances by exactly one version.
+
+### Parallel merge-inserts can silently duplicate keys
+
+Two write tasks that each hold one row for the same key will each find the key absent and
+each insert it. Neither task's input is internally ambiguous, so LanceDB accepts both and
+the key ends up in the table twice — with no error:
+
+```python
+# key 7 in two concurrent merge_inserts, once each
+# → table now contains id=7 twice
+```
+
+`write_lancedb` therefore hash-partitions the input on the `on` columns before an upsert,
+so every row for a given key lands in exactly one task. Where a key is genuinely repeated
+in the source, LanceDB then rejects it as an ambiguous merge rather than duplicating it —
+a loud error instead of corrupt data.
+
+This costs a shuffle. It changes nothing when the source's keys are already unique (a
+unique key can only occupy one block), so `partition_on_keys=False` skips it when you know
+that to be true.
+
+## Other notes and trade-offs
+
+- **`on_batch_error` defaults to `raise`.** Logging a failed write and continuing lets a
+  job report success while having silently lost data. `skip` is available when partial
+  completion genuinely is preferable, and dropped rows are counted and warned about.
+- **`max_rows_per_request` trades transactions for memory.** A task holds its rows in
+  memory so a failed write can be retried, so a very large `rows_per_transaction` raises
+  peak worker memory. Setting `max_rows_per_request` caps that, at the cost of splitting
+  the task back into several transactions.
 - **Local upserts are deliberately not highly parallel.** Concurrent merge-insert against
   a single local dataset contends on the commit lock, so local upsert defaults to
   `concurrency=4` with conflict retry. Remote upserts have no such limit — the service
   serialises for us.
-- **Filtered remote reads use pagination**, which is O(offset) on the server for deep
-  pages. For a highly selective filter over a large table, `remote_read_strategy="single"`
-  is often faster.
+- **Remote reads default to positional `take_offsets`.** The alternative,
+  `remote_read_strategy="pagination"`, measured ~2x faster locally and sends a
+  constant-size request (two integers) rather than an explicit list of offsets, and
+  neither degraded with offset depth over a 1M-row table. That is local measurement
+  though, against storage rather than the service — the positional primitive stays the
+  default because it is the one with guaranteed positional semantics. If you are pushing
+  volume through Enterprise, `pagination` is worth measuring against your endpoint.
+- **`batch_size` sets round trips, not total payload.** The same offsets are sent either
+  way, just in fewer requests, so raising it mostly buys fewer round trips. It defaults
+  to 50,000.
+- **For a highly selective filter over a large table**, `remote_read_strategy="single"`
+  streams the result through one task and often beats sharding it.
 - **API keys should come from `LANCEDB_API_KEY`** rather than the `api_key` argument, so
   the secret stays out of Ray task definitions and logs. The connection spec's `repr`
   redacts it either way.

@@ -233,18 +233,31 @@ class TestWriteStrategySelection:
                 local_write_strategy="fragment",
             )
 
-    def test_forcing_the_fragment_path_with_a_transform_is_refused(
-        self, db_dir: str
-    ) -> None:
-        with pytest.raises(ValueError, match="transform_fn"):
-            write_lancedb(
-                dataset_of(make_table(10)),
-                "items",
-                uri=db_dir,
-                mode="create",
-                transform_fn=lambda t: t,
-                local_write_strategy="fragment",
+    def test_a_transform_still_gets_the_single_commit_path(self, db_dir: str) -> None:
+        """transform_fn must not force a write onto the slower API path.
+
+        It runs as its own Ray stage, so the write itself is still one atomic
+        commit rather than a transaction per batch.
+        """
+
+        def shout(batch: pa.Table) -> pa.Table:
+            labels = [str(v).upper() for v in batch.column("label").to_pylist()]
+            return batch.set_column(
+                batch.schema.get_field_index("label"), "label", pa.array(labels)
             )
+
+        write_lancedb(
+            dataset_of(make_table(2000), blocks=4),
+            "items",
+            uri=db_dir,
+            mode="create",
+            transform_fn=shout,
+            local_write_strategy="fragment",
+        )
+
+        assert version_count(db_dir) == 1
+        table = lance.dataset(f"{db_dir}/items.lance").to_table()
+        assert all(v.startswith("ROW-") for v in table.column("label").to_pylist())
 
     def test_rejects_an_unknown_strategy(self, db_dir: str) -> None:
         with pytest.raises(ValueError, match="local_write_strategy must be"):
@@ -296,3 +309,128 @@ class TestTransformFn:
         )
 
         assert set(backend.rows("items").column("extra").to_pylist()) == {7}
+
+
+class TestTransactionEfficiency:
+    """One transaction per write task, not one per batch.
+
+    Every LanceDB transaction is a new table version and at least one fragment.
+    Writing per batch leaves a table full of tiny fragments and, against
+    Cloud/Enterprise, burns request quota -- so the sink hands each task's rows
+    to LanceDB as a single streamed write.
+    """
+
+    def test_api_path_writes_one_version_per_task(self, db_dir: str) -> None:
+        write_lancedb(dataset_of(make_table(1)), "items", uri=db_dir, mode="create")
+        before = version_count(db_dir)
+
+        # 20 blocks through the API path; Ray bundles them into few tasks.
+        write_lancedb(
+            dataset_of(make_table(20_000, start=1), blocks=20),
+            "items",
+            uri=db_dir,
+            mode="append",
+            local_write_strategy="api",
+            concurrency=2,
+        )
+
+        added = version_count(db_dir) - before
+        # Bounded by task count, not the 20 input blocks.
+        assert added <= 2, f"{added} versions for a 2-task write"
+
+    def test_small_max_rows_per_request_reintroduces_transactions(
+        self, db_dir: str
+    ) -> None:
+        """The memory-ceiling knob costs transactions; that's the trade-off."""
+        write_lancedb(dataset_of(make_table(1)), "items", uri=db_dir, mode="create")
+        before = version_count(db_dir)
+
+        write_lancedb(
+            dataset_of(make_table(1000, start=1)),
+            "items",
+            uri=db_dir,
+            mode="append",
+            local_write_strategy="api",
+            max_rows_per_request=100,
+            concurrency=1,
+        )
+
+        assert version_count(db_dir) - before >= 10
+
+    def test_fragment_count_stays_low_for_a_bulk_append(self, db_dir: str) -> None:
+        write_lancedb(
+            dataset_of(make_table(20_000), blocks=20),
+            "items",
+            uri=db_dir,
+            mode="create",
+            local_write_strategy="api",
+            concurrency=2,
+        )
+        fragments = len(lance.dataset(f"{db_dir}/items.lance").get_fragments())
+        assert fragments <= 4, f"{fragments} fragments for a 2-task write"
+
+
+class TestUpsertHashPartitioning:
+    """Parallel merge-inserts must not silently duplicate a key.
+
+    Two tasks each holding one row for key K will each find K absent and each
+    insert it. Neither source is internally ambiguous, so LanceDB accepts both
+    and the key ends up twice. Hash-partitioning on the key columns puts every
+    row for K in one task, where LanceDB rejects the ambiguity instead.
+    """
+
+    def test_unique_keys_across_many_tasks_produce_no_duplicates(
+        self, backend: Backend
+    ) -> None:
+        import collections
+
+        backend.create("items", make_table(200))
+
+        write_lancedb(
+            ray.data.from_arrow(make_table(400)).repartition(8),
+            "items",
+            uri=backend.uri,
+            mode="upsert",
+            on="id",
+            concurrency=4,
+            **backend.kwargs,
+        )
+
+        ids = backend.rows("items").column("id").to_pylist()
+        duplicates = {k: c for k, c in collections.Counter(ids).items() if c > 1}
+        assert not duplicates, f"duplicate keys after parallel upsert: {duplicates}"
+        assert len(ids) == 400
+
+    def test_repeated_source_keys_raise_instead_of_duplicating(
+        self, backend: Backend
+    ) -> None:
+        """A key repeated in the source is an error, not a silent duplicate."""
+        backend.create("items", make_table(50))
+        repeated = pa.concat_tables([make_table(25) for _ in range(4)])
+
+        with pytest.raises(Exception, match="[Aa]mbiguous"):
+            write_lancedb(
+                ray.data.from_arrow(repeated).repartition(8),
+                "items",
+                uri=backend.uri,
+                mode="upsert",
+                on="id",
+                concurrency=4,
+                **backend.kwargs,
+            )
+
+    def test_partitioning_can_be_disabled(self, backend: Backend) -> None:
+        """Opting out skips the shuffle; correctness is then the caller's."""
+        backend.create("items", make_table(100))
+
+        write_lancedb(
+            ray.data.from_arrow(make_table(50)),
+            "items",
+            uri=backend.uri,
+            mode="upsert",
+            on="id",
+            partition_on_keys=False,
+            concurrency=1,
+            **backend.kwargs,
+        )
+        assert backend.count("items") == 100

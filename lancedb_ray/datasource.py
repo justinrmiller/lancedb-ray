@@ -209,7 +209,9 @@ class LanceDBDatasource(Datasource):
             datasource is constructed, which keeps shards consistent even if
             another process writes to the table mid-read.
         strategy: Read strategy; see :data:`RemoteReadStrategy`.
-        batch_size: Rows per request issued by a read task.
+        batch_size: Rows fetched per request by a read task. Larger values mean
+            fewer round trips for the same total payload, since the number of
+            offsets sent is fixed by the row count either way.
         retry_policy: Retry behaviour for transient remote failures.
     """
 
@@ -222,7 +224,7 @@ class LanceDBDatasource(Datasource):
         filter: Optional[str] = None,
         version: Optional[Union[int, str]] = None,
         strategy: RemoteReadStrategy = "auto",
-        batch_size: int = 10_000,
+        batch_size: int = 50_000,
         retry_policy: Optional[RetryPolicy] = None,
     ) -> None:
         if batch_size <= 0:

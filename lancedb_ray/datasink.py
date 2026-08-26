@@ -117,8 +117,9 @@ class LanceDBDatasink(Datasink[WriteStats]):
         mode: WriteMode = "append",
         on: Optional[Union[str, list[str]]] = None,
         schema: Optional[pa.Schema] = None,
-        min_rows_per_write: int = 1024,
-        max_rows_per_request: int = 65_536,
+        rows_per_transaction: int = 256 * 1024,
+        max_rows_per_request: Optional[int] = None,
+        write_parallelism: Optional[int] = None,
         transform_fn: Optional[TransformFn] = None,
         when_matched_update_all: bool = True,
         when_not_matched_insert_all: bool = True,
@@ -127,11 +128,11 @@ class LanceDBDatasink(Datasink[WriteStats]):
         retry_policy: Optional[RetryPolicy] = None,
     ) -> None:
         normalized_on = validate_write_args(mode, on)
-        if min_rows_per_write <= 0:
+        if rows_per_transaction <= 0:
             raise ValueError(
-                f"min_rows_per_write must be positive, got {min_rows_per_write}"
+                f"rows_per_transaction must be positive, got {rows_per_transaction}"
             )
-        if max_rows_per_request <= 0:
+        if max_rows_per_request is not None and max_rows_per_request <= 0:
             raise ValueError(
                 f"max_rows_per_request must be positive, got {max_rows_per_request}"
             )
@@ -145,8 +146,9 @@ class LanceDBDatasink(Datasink[WriteStats]):
         self._mode: WriteMode = mode
         self._on = normalized_on
         self._schema = schema
-        self._min_rows_per_write = min_rows_per_write
+        self._rows_per_transaction = rows_per_transaction
         self._max_rows_per_request = max_rows_per_request
+        self._write_parallelism = write_parallelism
         self._transform_fn = transform_fn
         self._when_matched_update_all = when_matched_update_all
         self._when_not_matched_insert_all = when_not_matched_insert_all
@@ -163,7 +165,13 @@ class LanceDBDatasink(Datasink[WriteStats]):
 
     @property
     def min_rows_per_write(self) -> Optional[int]:
-        return self._min_rows_per_write
+        """Rows Ray should bundle into each write task.
+
+        This is what sets the transaction size: a task issues one LanceDB write
+        for everything it receives, so bundling more rows per task means fewer,
+        larger transactions and fewer fragments.
+        """
+        return self._rows_per_transaction
 
     def on_write_start(self, schema: Optional[pa.Schema] = None) -> None:
         """Create or reset the destination table, once, on the driver.
@@ -206,12 +214,26 @@ class LanceDBDatasink(Datasink[WriteStats]):
             )
 
     def write(self, blocks: Iterable[Block], ctx: TaskContext) -> WriteStats:
-        """Write one task's blocks, accumulating them into sized requests."""
+        """Write one task's blocks as a **single** LanceDB transaction.
+
+        Each transaction produces a new table version and at least one fragment,
+        so issuing one per incoming batch would leave a table with thousands of
+        tiny fragments and, against Cloud/Enterprise, invite rate limiting. The
+        rows are instead handed to LanceDB as one ``RecordBatchReader``: the
+        client streams that to the service as multiple parts under a single
+        upload, committing once.
+
+        Blocks are retained as Arrow batches rather than concatenated so the
+        reader can be rebuilt for a retry (a reader is single-use) without
+        paying for a copy. Peak memory is therefore one task's worth of rows,
+        which is what ``rows_per_transaction`` controls.
+        """
         table = connect(self._spec).open_table(self._table_name)
         stats = WriteStats()
 
-        pending: list[pa.Table] = []
-        pending_rows = 0
+        schema: Optional[pa.Schema] = None
+        batches: list[pa.RecordBatch] = []
+        num_rows = 0
 
         for block in blocks:
             arrow_block = BlockAccessor.for_block(block).to_arrow()
@@ -219,54 +241,95 @@ class LanceDBDatasink(Datasink[WriteStats]):
                 arrow_block = self._transform_fn(arrow_block)
             if arrow_block.num_rows == 0:
                 continue
+            if schema is None:
+                schema = arrow_block.schema
+            batches.extend(arrow_block.to_batches())
+            num_rows += arrow_block.num_rows
 
-            pending.append(arrow_block)
-            pending_rows += arrow_block.num_rows
+        if not batches or schema is None:
+            return stats
 
-            if pending_rows >= self._min_rows_per_write:
-                self._flush(table, pending, stats)
-                pending, pending_rows = [], 0
-
-        if pending:
-            self._flush(table, pending, stats)
+        if self._max_rows_per_request is not None:
+            # Opt-in: trade extra transactions for a lower memory ceiling.
+            self._write_in_chunks(table, schema, batches, stats)
+        else:
+            self._write_once(table, schema, batches, num_rows, stats)
 
         return stats
 
-    def _flush(self, table: Any, pending: list[pa.Table], stats: WriteStats) -> None:
-        """Concatenate pending blocks and write them in request-sized pieces."""
-        combined = (
-            pending[0]
-            if len(pending) == 1
-            else pa.concat_tables(pending, promote_options="default")
-        )
+    def _write_once(
+        self,
+        table: Any,
+        schema: pa.Schema,
+        batches: list[pa.RecordBatch],
+        num_rows: int,
+        stats: WriteStats,
+    ) -> None:
+        """Issue exactly one write for the whole task."""
+        try:
+            call_with_retry(
+                # Rebuild the reader per attempt: a RecordBatchReader is
+                # exhausted once consumed, so a retry needs a fresh one.
+                lambda: self._write_reader(
+                    table, pa.RecordBatchReader.from_batches(schema, iter(batches))
+                ),
+                self._retry_policy,
+                description=f"write to {self._table_name}",
+            )
+        except Exception as error:  # noqa: BLE001 - policy decides
+            if self._on_batch_error == "raise":
+                raise
+            logger.error(
+                "Dropping %d rows destined for %s after retries: %s",
+                num_rows,
+                self._table_name,
+                error,
+            )
+            stats.num_skipped_rows += num_rows
+            return
 
-        for piece in split_arrow_table(combined.num_rows, self._max_rows_per_request):
-            batch = combined.slice(piece.start, piece.num_rows)
-            try:
-                call_with_retry(
-                    lambda batch=batch: self._write_batch(table, batch),  # type: ignore[misc]
-                    self._retry_policy,
-                    description=f"write to {self._table_name}",
-                )
-            except Exception as error:  # noqa: BLE001 - policy decides
-                if self._on_batch_error == "raise":
-                    raise
-                logger.error(
-                    "Dropping a batch of %d rows destined for %s after retries: %s",
-                    batch.num_rows,
-                    self._table_name,
-                    error,
-                )
-                stats.num_skipped_rows += batch.num_rows
-                continue
+        stats.num_rows += num_rows
+        stats.num_batches += 1
 
-            stats.num_rows += batch.num_rows
-            stats.num_batches += 1
+    def _write_in_chunks(
+        self,
+        table: Any,
+        schema: pa.Schema,
+        batches: list[pa.RecordBatch],
+        stats: WriteStats,
+    ) -> None:
+        """Write in bounded pieces when a memory ceiling was requested."""
+        assert self._max_rows_per_request is not None
+        limit = self._max_rows_per_request
 
-    def _write_batch(self, table: Any, batch: pa.Table) -> None:
-        """Issue a single ``add`` or ``merge_insert`` for one batch."""
+        chunk: list[pa.RecordBatch] = []
+        chunk_rows = 0
+
+        def flush() -> None:
+            nonlocal chunk, chunk_rows
+            if not chunk:
+                return
+            self._write_once(table, schema, chunk, chunk_rows, stats)
+            chunk, chunk_rows = [], 0
+
+        for batch in batches:
+            for piece in split_arrow_table(batch.num_rows, limit):
+                sliced = batch.slice(piece.start, piece.num_rows)
+                chunk.append(sliced)
+                chunk_rows += sliced.num_rows
+                if chunk_rows >= limit:
+                    flush()
+        flush()
+
+    def _write_reader(self, table: Any, reader: pa.RecordBatchReader) -> None:
+        """Issue a single ``add`` or ``merge_insert`` for a stream of rows."""
         if self._mode != "upsert":
-            table.add(batch)
+            add_kwargs: dict[str, Any] = {}
+            if self._write_parallelism is not None:
+                # Controls how many parts the client uploads concurrently
+                # within this one transaction.
+                add_kwargs["write_parallelism"] = self._write_parallelism
+            table.add(reader, **add_kwargs)
             return
 
         assert self._on is not None  # guaranteed by __init__ validation
@@ -280,7 +343,7 @@ class LanceDBDatasink(Datasink[WriteStats]):
             builder = builder.when_not_matched_by_source_delete(
                 None if delete_cond is True else delete_cond
             )
-        builder.execute(batch)
+        builder.execute(reader)
 
     def on_write_complete(self, write_result: WriteResult[WriteStats]) -> None:
         total_rows = sum(s.num_rows for s in write_result.write_returns)

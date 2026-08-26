@@ -36,6 +36,13 @@ def no_sleep_policy(**kwargs: Any) -> RetryPolicy:
     return RetryPolicy(initial_backoff_s=0.0, max_backoff_s=0.0, **kwargs)
 
 
+def write_arrow(
+    sink: LanceDBDatasink, handle: Any, arrow: pa.Table, stats: WriteStats
+) -> None:
+    """Drive one transaction directly, bypassing Ray's block plumbing."""
+    sink._write_once(handle, arrow.schema, arrow.to_batches(), arrow.num_rows, stats)
+
+
 class TestValidation:
     def test_rejects_bad_mode(self, spec: LanceDBConnectionSpec) -> None:
         with pytest.raises(ValueError, match="mode must be one of"):
@@ -50,11 +57,11 @@ class TestValidation:
             LanceDBDatasink(spec, "items", mode="append", on="id")
 
     @pytest.mark.parametrize("value", [0, -1])
-    def test_rejects_bad_min_rows(
+    def test_rejects_bad_rows_per_transaction(
         self, spec: LanceDBConnectionSpec, value: int
     ) -> None:
-        with pytest.raises(ValueError, match="min_rows_per_write must be positive"):
-            LanceDBDatasink(spec, "items", min_rows_per_write=value)
+        with pytest.raises(ValueError, match="rows_per_transaction must be positive"):
+            LanceDBDatasink(spec, "items", rows_per_transaction=value)
 
     def test_rejects_bad_max_rows(self, spec: LanceDBConnectionSpec) -> None:
         with pytest.raises(ValueError, match="max_rows_per_request must be positive"):
@@ -76,11 +83,11 @@ class TestValidation:
     def test_supports_distributed_writes(self, spec: LanceDBConnectionSpec) -> None:
         assert LanceDBDatasink(spec, "items").supports_distributed_writes
 
-    def test_min_rows_per_write_is_exposed_to_ray(
+    def test_rows_per_transaction_is_exposed_to_ray(
         self, spec: LanceDBConnectionSpec
     ) -> None:
         assert (
-            LanceDBDatasink(spec, "items", min_rows_per_write=99).min_rows_per_write
+            LanceDBDatasink(spec, "items", rows_per_transaction=99).min_rows_per_write
             == 99
         )
 
@@ -139,37 +146,45 @@ class TestTableCreation:
 
 
 class TestBatching:
-    def test_blocks_are_accumulated_before_writing(
+    def test_a_task_writes_one_transaction_regardless_of_block_count(
         self, seeded_spec: LanceDBConnectionSpec
     ) -> None:
-        sink = LanceDBDatasink(seeded_spec, "items", min_rows_per_write=100)
+        """Ten incoming blocks must not become ten transactions.
+
+        Each transaction is a new table version and at least one fragment, so
+        per-block writes are what leave a table with thousands of tiny
+        fragments and invite rate limiting on Cloud/Enterprise.
+        """
+        sink = LanceDBDatasink(seeded_spec, "items")
         blocks = [make_table(10, start=i * 10) for i in range(10)]
 
         stats = sink.write(iter(blocks), ctx=None)  # type: ignore[arg-type]
 
         assert stats.num_rows == 100
-        # 10 blocks of 10 rows accumulate into a single 100-row request.
         assert stats.num_batches == 1
 
-    def test_large_accumulations_are_split(
+    def test_max_rows_per_request_trades_memory_for_transactions(
         self, seeded_spec: LanceDBConnectionSpec
     ) -> None:
-        sink = LanceDBDatasink(
-            seeded_spec, "items", min_rows_per_write=100, max_rows_per_request=25
-        )
+        sink = LanceDBDatasink(seeded_spec, "items", max_rows_per_request=25)
         stats = sink.write(iter([make_table(100)]), ctx=None)  # type: ignore[arg-type]
 
         assert stats.num_rows == 100
         assert stats.num_batches == 4
 
-    def test_trailing_partial_batch_is_flushed(
+    def test_a_small_task_still_writes(
         self, seeded_spec: LanceDBConnectionSpec
     ) -> None:
-        sink = LanceDBDatasink(seeded_spec, "items", min_rows_per_write=1000)
+        sink = LanceDBDatasink(seeded_spec, "items")
         stats = sink.write(iter([make_table(7)]), ctx=None)  # type: ignore[arg-type]
-        # Fewer rows than the threshold must still be written, not dropped.
         assert stats.num_rows == 7
         assert stats.num_batches == 1
+
+    def test_rows_per_transaction_is_what_ray_bundles(
+        self, seeded_spec: LanceDBConnectionSpec
+    ) -> None:
+        sink = LanceDBDatasink(seeded_spec, "items", rows_per_transaction=4096)
+        assert sink.min_rows_per_write == 4096
 
     def test_empty_blocks_are_skipped(self, seeded_spec: LanceDBConnectionSpec) -> None:
         sink = LanceDBDatasink(seeded_spec, "items")
@@ -217,7 +232,7 @@ class TestRetryAndErrorPolicy:
         sink = LanceDBDatasink(seeded_spec, "items", retry_policy=no_sleep_policy())
         stats = WriteStats()
 
-        sink._flush(table, [make_table(5)], stats)
+        write_arrow(sink, table, make_table(5), stats)
 
         assert stats.num_rows == 5
         assert table.attempts == 3, "expected two failures then a success"
@@ -233,7 +248,7 @@ class TestRetryAndErrorPolicy:
         # Raising is the deliberate default: silently dropping batches would
         # let a write job report success on partial data.
         with pytest.raises(TimeoutError):
-            sink._flush(table, [make_table(5)], WriteStats())
+            write_arrow(sink, table, make_table(5), WriteStats())
 
     def test_skip_policy_drops_the_batch_and_records_it(
         self, seeded_spec: LanceDBConnectionSpec
@@ -247,14 +262,15 @@ class TestRetryAndErrorPolicy:
         )
         stats = WriteStats()
 
-        sink._flush(table, [make_table(5)], stats)
+        write_arrow(sink, table, make_table(5), stats)
 
         assert stats.num_rows == 0
         assert stats.num_skipped_rows == 5
 
-    def test_skip_policy_continues_with_later_batches(
+    def test_skip_policy_continues_with_later_chunks(
         self, seeded_spec: LanceDBConnectionSpec
     ) -> None:
+        """With a memory ceiling set, a failed chunk must not sink the rest."""
         table = self._flaky(seeded_spec, failures=1)
         sink = LanceDBDatasink(
             seeded_spec,
@@ -264,10 +280,11 @@ class TestRetryAndErrorPolicy:
             retry_policy=no_sleep_policy(max_attempts=1),
         )
         stats = WriteStats()
+        arrow = make_table(10)
 
-        sink._flush(table, [make_table(10)], stats)
+        sink._write_in_chunks(table, arrow.schema, arrow.to_batches(), stats)
 
-        # First 5-row request fails and is skipped; the second still lands.
+        # First 5-row transaction fails and is skipped; the second still lands.
         assert stats.num_skipped_rows == 5
         assert stats.num_rows == 5
 
@@ -287,7 +304,7 @@ class TestRetryAndErrorPolicy:
         )
 
         with pytest.raises(ValueError, match="schema mismatch"):
-            sink._flush(table, [make_table(5)], WriteStats())
+            write_arrow(sink, table, make_table(5), WriteStats())
         assert table.attempts == 1
 
 
@@ -327,7 +344,7 @@ class TestUpsertBuilderOptions:
         table = db.open_table("items")
 
         sink = self._sink(seeded_spec, when_not_matched_by_source_delete=True)
-        sink._flush(table, [make_table(10)], WriteStats())
+        write_arrow(sink, table, make_table(10), WriteStats())
 
         # Rows 10..99 had no match in the source and were removed.
         assert table.count_rows() == 10
@@ -339,7 +356,7 @@ class TestUpsertBuilderOptions:
         table = db.open_table("items")
 
         sink = self._sink(seeded_spec, when_not_matched_by_source_delete="id >= 50")
-        sink._flush(table, [make_table(10)], WriteStats())
+        write_arrow(sink, table, make_table(10), WriteStats())
 
         # Only unmatched rows satisfying the predicate are deleted.
         assert table.count_rows() == 50
@@ -348,7 +365,7 @@ class TestUpsertBuilderOptions:
         db = lancedb.connect(seeded_spec.uri, **seeded_spec.connect_kwargs())
         table = db.open_table("items")
 
-        self._sink(seeded_spec)._flush(table, [make_table(10)], WriteStats())
+        write_arrow(self._sink(seeded_spec), table, make_table(10), WriteStats())
         assert table.count_rows() == 100
 
 
