@@ -53,9 +53,22 @@ and all Cloud/Enterprise writes go through LanceDB's table API with batching and
 
 ## Install
 
+Not published to PyPI. Install from the repository:
+
 ```bash
-pip install lancedb-ray
+uv pip install git+ssh://git@github.com/justinrmiller/lancedb-ray.git
 ```
+
+Or for local development:
+
+```bash
+git clone https://github.com/justinrmiller/lancedb-ray.git
+cd lancedb-ray
+uv venv --python 3.12
+make build
+```
+
+Requires Python 3.10–3.13.
 
 ## API
 
