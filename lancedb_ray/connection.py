@@ -205,7 +205,9 @@ class LanceDBConnectionSpec:
 
 
 @cache
-def _connect_cached(spec: LanceDBConnectionSpec) -> lancedb.DBConnection:
+def _connect_cached(
+    spec: LanceDBConnectionSpec, resolved_api_key: Optional[str]
+) -> lancedb.DBConnection:
     import lancedb
 
     return lancedb.connect(spec.uri, **spec.connect_kwargs())
@@ -216,8 +218,16 @@ def connect(spec: LanceDBConnectionSpec) -> lancedb.DBConnection:
 
     Ray workers call this on every task; the cache makes all but the first call
     in a given process free.
+
+    The cache key includes the *resolved* API key, not just the spec. A spec
+    that takes its key from the environment looks identical before and after
+    that key changes, so caching on the spec alone would hand back a connection
+    still holding a revoked or rotated credential -- and in a process serving
+    more than one tenant, the wrong one. The resolved key stays in this
+    process's cache key and is never written into the spec, which is what
+    keeps it out of shipped task definitions and logs.
     """
-    return _connect_cached(spec)
+    return _connect_cached(spec, spec.resolve_api_key())
 
 
 def clear_connection_cache() -> None:

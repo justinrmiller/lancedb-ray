@@ -575,3 +575,80 @@ class TestAtLeastOnceBoundary:
 
         write_arrow(sink, handle, make_table(10), WriteStats())
         assert handle.attempts == 2
+
+
+class TestArrowAlignmentRecovery:
+    """Ray blocks are zero-copy views into its object store.
+
+    A view can start at an offset that is fine for Python but violates what
+    arrow-rs requires when importing through the C data interface -- decimal128
+    wants 16 bytes -- and the import panics rather than degrading. It fails
+    before writing anything, so recovering by copying into fresh buffers cannot
+    duplicate rows.
+    """
+
+    def test_realign_produces_equal_data(self) -> None:
+        import decimal
+
+        from lancedb_ray.datasink import _realign
+
+        table = pa.table(
+            {
+                "id": pa.array([1, 2], pa.int64()),
+                "dec": pa.array(
+                    [decimal.Decimal("1.25"), decimal.Decimal("-9.99")],
+                    pa.decimal128(10, 2),
+                ),
+            }
+        )
+        realigned = _realign(table.to_batches(), table.schema)
+        assert pa.Table.from_batches(realigned, schema=table.schema).equals(table)
+
+    def test_an_alignment_failure_is_retried_realigned(
+        self, seeded_spec: LanceDBConnectionSpec
+    ) -> None:
+        class RejectsUnaligned:
+            """Refuses the first import the way arrow-rs does, then accepts."""
+
+            def __init__(self) -> None:
+                self.attempts = 0
+
+            def add(self, reader: Any, **kwargs: Any) -> None:
+                self.attempts += 1
+                reader.read_all()
+                if self.attempts == 1:
+                    raise RuntimeError(
+                        "Reader task panicked: Memory pointer from external "
+                        "source (e.g, FFI) is not aligned with the specified "
+                        "scalar type."
+                    )
+
+        handle = RejectsUnaligned()
+        sink = LanceDBDatasink(seeded_spec, "items", mode="append")
+        stats = WriteStats()
+        arrow = make_table(5)
+
+        write_arrow(sink, handle, arrow, stats)
+
+        assert handle.attempts == 2, "expected exactly one realigned retry"
+        assert stats.num_rows == 5
+
+    def test_a_non_alignment_error_is_not_realigned(
+        self, seeded_spec: LanceDBConnectionSpec
+    ) -> None:
+        class AlwaysFails:
+            def __init__(self) -> None:
+                self.attempts = 0
+
+            def add(self, reader: Any, **kwargs: Any) -> None:
+                self.attempts += 1
+                raise ValueError("schema mismatch")
+
+        handle = AlwaysFails()
+        sink = LanceDBDatasink(seeded_spec, "items", mode="append")
+
+        with pytest.raises(ValueError, match="schema mismatch"):
+            write_arrow(sink, handle, make_table(5), WriteStats())
+
+        # No realigned second pass for an error realignment cannot fix.
+        assert handle.attempts == 1

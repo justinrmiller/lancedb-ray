@@ -18,6 +18,7 @@ from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING, Any, Literal, Optional, Union
 
 import pyarrow as pa
+import pyarrow.compute as pc
 from ray.data.block import Block, BlockAccessor
 from ray.data.datasource import Datasink
 from ray.data.datasource.datasink import WriteResult
@@ -26,6 +27,7 @@ from ._plan import split_arrow_table
 from ._retry import (
     RetryPolicy,
     call_with_retry,
+    is_arrow_alignment_error,
     is_commit_conflict,
     is_definitely_not_applied,
     is_transient,
@@ -100,6 +102,23 @@ def _append_retry_predicate(error: BaseException) -> bool:
     surfaced rather than replayed.
     """
     return is_definitely_not_applied(error) or is_commit_conflict(error)
+
+
+def _realign(batches: list[pa.RecordBatch], schema: pa.Schema) -> list[pa.RecordBatch]:
+    """Copy batches into freshly allocated, correctly aligned buffers.
+
+    Ray blocks are zero-copy views into its object store. A view can start at
+    an offset that is fine for Python but violates the alignment arrow-rs
+    demands when importing through the C data interface -- decimal128 wants 16
+    bytes, and the import panics rather than degrading. ``take`` runs in
+    Arrow's own kernels and allocates fresh output, which an IPC round-trip
+    does not: reading an IPC stream back is itself zero-copy over the buffer.
+    """
+    table = pa.Table.from_batches(batches, schema=schema)
+    indices = pa.array(range(table.num_rows), pa.int64())
+    realigned: pa.Table = pc.take(table, indices)
+    batches_out: list[pa.RecordBatch] = realigned.to_batches()
+    return batches_out
 
 
 def _align_to_schema(block: pa.Table, schema: pa.Schema) -> pa.Table:
@@ -320,16 +339,32 @@ class LanceDBDatasink(Datasink[WriteStats]):
         stats: WriteStats,
     ) -> None:
         """Issue exactly one write for the whole task."""
-        try:
+
+        def attempt(payload: list[pa.RecordBatch]) -> None:
             call_with_retry(
                 # Rebuild the reader per attempt: a RecordBatchReader is
                 # exhausted once consumed, so a retry needs a fresh one.
                 lambda: self._write_reader(
-                    table, pa.RecordBatchReader.from_batches(schema, iter(batches))
+                    table, pa.RecordBatchReader.from_batches(schema, iter(payload))
                 ),
                 self._retry_policy,
                 description=f"write to {self._table_name}",
             )
+
+        try:
+            try:
+                attempt(batches)
+            except Exception as error:
+                if not is_arrow_alignment_error(error):
+                    raise
+                # The FFI import refused the buffers before writing anything,
+                # so re-sending a realigned copy cannot duplicate rows.
+                logger.debug(
+                    "Realigning %d batches for %s after an Arrow alignment rejection.",
+                    len(batches),
+                    self._table_name,
+                )
+                attempt(_realign(batches, schema))
         except Exception as error:  # noqa: BLE001 - policy decides
             if self._on_batch_error == "raise":
                 raise

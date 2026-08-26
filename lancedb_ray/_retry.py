@@ -82,6 +82,23 @@ def is_definitely_not_applied(error: BaseException) -> bool:
     return any(marker in message for marker in _NOT_APPLIED_MARKERS)
 
 
+#: Arrow-rs refuses to import a buffer whose pointer is not aligned for its
+#: scalar type. Ray hands out zero-copy views into its object store, and a
+#: view can land unaligned for a type that needs more than 8 bytes, such as
+#: decimal128. The import fails before anything is written.
+_ALIGNMENT_MARKERS = ("is not aligned with the specified scalar type",)
+
+
+def is_arrow_alignment_error(error: BaseException) -> bool:
+    """Whether ``error`` is arrow-rs rejecting an unaligned FFI buffer.
+
+    Recoverable by copying the batch into freshly allocated memory, and safe
+    to retry: the import fails before any data is committed.
+    """
+    message = str(error)
+    return any(marker in message for marker in _ALIGNMENT_MARKERS)
+
+
 def is_commit_conflict(error: BaseException) -> bool:
     """Return whether ``error`` looks like a losing race on a dataset commit."""
     message = str(error).lower()

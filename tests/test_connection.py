@@ -493,3 +493,41 @@ class TestUriSchemeNormalisation:
     )
     def test_still_local(self, uri: str) -> None:
         assert not LanceDBConnectionSpec.create(uri).is_remote
+
+
+class TestCredentialRotation:
+    """The cache must not outlive the credential it was opened with.
+
+    A spec that takes its key from the environment looks identical before and
+    after that key changes, so caching on the spec alone hands back a
+    connection still holding a revoked one -- and in a process serving more
+    than one tenant, the wrong one.
+    """
+
+    def test_a_rotated_environment_key_opens_a_new_connection(
+        self, db_dir: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(API_KEY_ENV_VAR, "first-key")
+        spec = LanceDBConnectionSpec.create(db_dir)
+        first = connect(spec)
+
+        monkeypatch.setenv(API_KEY_ENV_VAR, "rotated-key")
+        assert connect(spec) is not first
+
+    def test_an_unchanged_key_still_reuses_the_connection(
+        self, db_dir: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(API_KEY_ENV_VAR, "steady-key")
+        spec = LanceDBConnectionSpec.create(db_dir)
+        assert connect(spec) is connect(spec)
+
+    def test_the_key_is_never_written_into_the_spec(
+        self, db_dir: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(API_KEY_ENV_VAR, "secret-key")
+        spec = LanceDBConnectionSpec.create(db_dir)
+        connect(spec)
+        # Resolution happens per process; the shipped spec stays key-free so
+        # the secret never reaches a task definition or a log line.
+        assert spec.api_key is None
+        assert "secret-key" not in repr(spec)
