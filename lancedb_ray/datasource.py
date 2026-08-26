@@ -74,14 +74,13 @@ def _apply_columns(query: Any, columns: Optional[list[str]]) -> Any:
     return query
 
 
-def _concat(tables: list[pa.Table], schema: Optional[pa.Schema]) -> pa.Table:
-    """Concatenate result tables, preserving schema for the empty case."""
-    non_empty = [t for t in tables if t.num_rows > 0]
-    if not non_empty:
-        return pa.Table.from_pylist([], schema=schema) if schema else pa.table({})
-    if len(non_empty) == 1:
-        return non_empty[0]
-    return pa.concat_tables(non_empty, promote_options="default")
+def _empty_table(schema: Optional[pa.Schema]) -> pa.Table:
+    """An empty block that still carries the schema, when one is known.
+
+    A read task must yield at least one block so Ray can infer a schema for the
+    resulting Dataset, even when the task matched no rows.
+    """
+    return pa.Table.from_pylist([], schema=schema) if schema else pa.table({})
 
 
 def _read_offsets(
@@ -101,7 +100,7 @@ def _read_offsets(
     """
     table = open_table(spec, table_name, version=version)
 
-    results: list[pa.Table] = []
+    produced = False
     for chunk in chunk_offsets(offsets, batch_size):
         result = call_with_retry(
             lambda chunk=chunk: _apply_columns(  # type: ignore[misc]
@@ -110,9 +109,14 @@ def _read_offsets(
             retry_policy,
             description=f"take_offsets on {table_name}",
         )
-        results.append(result)
+        if result.num_rows:
+            produced = True
+            # Yield per chunk rather than accumulating: a large shard would
+            # otherwise hold every batch in worker memory at once.
+            yield result
 
-    yield _concat(results, schema)
+    if not produced:
+        yield _empty_table(schema)
 
 
 def _read_pagination(
@@ -133,7 +137,7 @@ def _read_pagination(
     """
     table = open_table(spec, table_name, version=version)
 
-    results: list[pa.Table] = []
+    produced = False
     for start in range(offsets.start, offsets.end, batch_size):
         limit = min(batch_size, offsets.end - start)
 
@@ -146,13 +150,16 @@ def _read_pagination(
         result = call_with_retry(
             fetch, retry_policy, description=f"paged read of {table_name}"
         )
-        results.append(result)
+        if result.num_rows:
+            produced = True
+            yield result
         if result.num_rows < limit:
             # Short page: the filtered result set ended early. Later pages
             # would be empty, so stop rather than issuing pointless requests.
             break
 
-    yield _concat(results, schema)
+    if not produced:
+        yield _empty_table(schema)
 
 
 def _read_single(
@@ -187,7 +194,7 @@ def _read_single(
         empty = False
         yield pa.Table.from_batches([batch])
     if empty:
-        yield _concat([], schema)
+        yield _empty_table(schema)
 
 
 class LanceDBDatasource(Datasource):
