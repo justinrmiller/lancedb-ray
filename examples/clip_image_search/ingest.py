@@ -49,8 +49,8 @@ from embedding import (  # noqa: E402
     load_clip,
 )
 
-#: Extensions treated as JPEGs. LanceDB stores the path, so anything Pillow can
-#: decode would work; this keeps the example's scope obvious.
+#: Extensions treated as JPEGs. Anything Pillow can decode would work; this
+#: keeps the example's scope obvious.
 JPEG_EXTENSIONS = ("*.jpg", "*.jpeg", "*.JPG", "*.JPEG")
 
 
@@ -66,6 +66,10 @@ def build_schema() -> pa.Schema:
             pa.field("path", pa.string()),
             pa.field("filename", pa.string()),
             pa.field("num_bytes", pa.int64()),
+            # The JPEG itself lives in the table. Lance is a multimodal store,
+            # so the pixels travel with the embedding rather than being a path
+            # into a directory that can move, be renamed, or disappear.
+            pa.field("image", pa.large_binary()),
             pa.field("vector", pa.list_(pa.float32(), EMBEDDING_DIM)),
         ]
     )
@@ -86,6 +90,7 @@ class ClipEmbedder:
         images = []
         paths = []
         sizes = []
+        payloads = []
 
         for payload, path in zip(batch["bytes"], batch["path"], strict=True):
             try:
@@ -95,6 +100,8 @@ class ClipEmbedder:
                 continue
             paths.append(str(path))
             sizes.append(len(payload))
+            # Keep the original bytes: they are written alongside the vector.
+            payloads.append(bytes(payload))
 
         if not images:
             # Ray requires the output schema to be stable even for an empty batch.
@@ -102,6 +109,7 @@ class ClipEmbedder:
                 "path": np.array([], dtype=object),
                 "filename": np.array([], dtype=object),
                 "num_bytes": np.array([], dtype=np.int64),
+                "image": np.array([], dtype=object),
                 "vector": np.zeros((0, EMBEDDING_DIM), dtype=np.float32),
             }
 
@@ -110,6 +118,7 @@ class ClipEmbedder:
             "path": np.array(paths, dtype=object),
             "filename": np.array([Path(p).name for p in paths], dtype=object),
             "num_bytes": np.array(sizes, dtype=np.int64),
+            "image": np.array(payloads, dtype=object),
             "vector": vectors,
         }
 
@@ -246,7 +255,8 @@ def main() -> None:
 
         print(
             f"\nDone. Explore it with:\n"
-            f"  streamlit run examples/clip_image_search/app.py -- "
+            f"  streamlit run examples/clip_image_search/app.py "
+            f"--server.fileWatcherType none -- "
             f"--uri {uri} --table {args.table}"
         )
     finally:

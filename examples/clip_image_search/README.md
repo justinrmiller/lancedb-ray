@@ -57,10 +57,17 @@ to how many images fit in one forward pass. On a GPU, raise both and pass
 ## 2. Search
 
 ```bash
-streamlit run examples/clip_image_search/app.py -- --uri ./demo_db
+streamlit run examples/clip_image_search/app.py --server.fileWatcherType none -- --uri ./demo_db
 ```
 
 The `--` matters: it separates Streamlit's own arguments from the script's.
+
+`--server.fileWatcherType none` matters too. Streamlit's default watcher walks
+`sys.modules` and inspects every module's path; transformers resolves attributes
+lazily, so that inspection *imports* every image-processing module it has —
+hundreds of them, most requiring `torchvision` — and floods the console with
+`ModuleNotFoundError: No module named 'torchvision'`. Turning the watcher off
+avoids it entirely (at the cost of auto-reload when you edit the app).
 
 Type a description and the app embeds it with the *text* half of the same CLIP
 model, then runs a vector search against the image embeddings. Results come back
@@ -124,9 +131,18 @@ let the index find candidates fast, then rank them precisely.
 of `lancedb-ray` yet — the library covers reads and writes. `table.create_index`
 is LanceDB's own API, which is exactly what you would use today.
 
-**Only paths are stored, not image bytes.** The table holds each file's path, so
-the app reads originals from disk at display time. If you move or delete the
-photos, re-run the ingestion.
+**The JPEG bytes live in the table.** Lance is a multimodal store, so the pixels
+travel with the embedding instead of being a path into a directory that can be
+moved, renamed, or cleaned up. The app renders results straight from LanceDB and
+keeps working after the originals are gone. The path is still stored as
+metadata, and the app falls back to it for tables written before the column
+existed.
+
+**Click any result to inspect the row behind it.** Streamlit cannot attach a
+click handler to an image, so the caption under each result is a button; it
+opens a dialog showing every stored field, the image itself, and the embedding.
+From there, "Find similar images" re-runs the search using that row's own
+vector — image-to-image search with no text involved.
 
 **Unreadable files are skipped, not fatal.** A corrupt JPEG logs a warning and
 the job continues rather than losing an entire batch.
