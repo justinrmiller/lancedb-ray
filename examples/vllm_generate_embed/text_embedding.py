@@ -34,7 +34,7 @@ def load_embedder(
     # Annotated Any: transformers' annotations vary across versions and are
     # absent entirely in the lint environment, so type-checking these calls
     # would pass in one and fail in the other.
-    tokenizer: Any = AutoTokenizer.from_pretrained(model_name)
+    tokenizer: Any = AutoTokenizer.from_pretrained(model_name)  # type: ignore[no-untyped-call]
     model: Any = AutoModel.from_pretrained(model_name)
     model.to(device)
     model.eval()

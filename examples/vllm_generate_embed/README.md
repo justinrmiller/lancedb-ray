@@ -32,10 +32,9 @@ They emit the same columns, so everything downstream is identical. The
 laptop — vLLM does not install usefully on Apple silicon, and a GPU-only example
 is one nobody can try before committing to a cluster.
 
-**The `vllm` path is untested here.** It is written against Ray 2.58's
-`build_processor` / `vLLMEngineProcessorConfig` API, verified against the
-installed package rather than the docs alone, but this machine has no CUDA GPU.
-The `transformers` path is what was actually run.
+Both paths have been run end to end. vLLM has no CUDA device on Apple silicon
+and falls back to its CPU backend -- slow (52s for 12 short answers, most of it
+engine warm-up) but functional, which is enough to prove the wiring.
 
 ## Setup
 
@@ -48,6 +47,16 @@ For the vLLM path, additionally:
 ```bash
 uv pip install "ray[llm]" vllm
 ```
+
+**Two version constraints matter here**, both discovered by running it:
+
+`ray` is pinned to exactly 2.58.0. `ray.data.llm` renamed
+`build_llm_processor` to `build_processor` between releases, so an environment
+that drifts to 2.50 fails at import.
+
+`transformers` must be **below 5** when using the vLLM engine. vLLM 0.11 calls
+`tokenizer.all_special_tokens_extended`, which transformers 5 removed, and the
+engine dies during tokenizer init with an `AttributeError`.
 
 ## 1. Generate
 
@@ -118,6 +127,11 @@ questions back.
 **Embeddings are mean-pooled and L2-normalised.** Pooling is masked so padding
 does not drag the average around, and normalising at write time makes cosine
 similarity a plain dot product.
+
+**The original prompt is carried through as `user_prompt`.** Ray's
+chat-template stage overwrites the `prompt` column with the fully templated
+text -- system turn, role markers and all -- so postprocess reads a separate
+key to store the question actually asked rather than the template around it.
 
 **No index is built.** A dozen answers is far below where an ANN index helps —
 see the image-search example's README for why a small collection is better off

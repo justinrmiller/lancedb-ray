@@ -4,10 +4,13 @@
 # torch is large. For CPU-only machines the CPU wheel is much smaller:
 #   uv pip install torch --index-url https://download.pytorch.org/whl/cpu
 torch>=2.0
-transformers>=4.40
+# vLLM 0.11 calls tokenizer.all_special_tokens_extended, which transformers 5
+# removed: the engine dies during tokenizer init with an AttributeError. Cap
+# transformers below 5 whenever the vllm engine is in play.
+transformers>=4.40,<5
 streamlit>=1.30
 
-# --engine vllm additionally needs Ray's LLM extra and vLLM itself. Both want
-# a CUDA GPU; neither installs usefully on Apple silicon, which is why the
-# example also has a --engine transformers path.
+# --engine vllm additionally needs Ray's LLM extra and vLLM itself:
 #   uv pip install "ray[llm]" vllm
+# vLLM picks a CPU backend when no CUDA device is present, which is slow but
+# works -- the example was verified that way on Apple silicon.

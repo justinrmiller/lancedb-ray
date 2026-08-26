@@ -132,9 +132,15 @@ def generate_with_vllm(
                 "temperature": temperature,
                 "max_tokens": max_tokens,
             },
+            # Carry the original question under a key the pipeline will not
+            # touch. The chat-template stage overwrites "prompt" with the
+            # fully templated text -- system turn, role markers and all -- so
+            # reading it back in postprocess would store that instead of the
+            # question the user actually asked.
+            "user_prompt": row["prompt"],
         },
         postprocess=lambda row: {
-            "prompt": row["prompt"],
+            "prompt": row["user_prompt"],
             "response": row["generated_text"],
             "model": model,
         },
@@ -158,7 +164,7 @@ class LocalGenerator:
         # Locals annotated Any: transformers' annotations vary across versions
         # and are absent entirely in the lint environment, so type-checking
         # these calls would pass in one and fail in the other.
-        tokenizer: Any = AutoTokenizer.from_pretrained(model_name)
+        tokenizer: Any = AutoTokenizer.from_pretrained(model_name)  # type: ignore[no-untyped-call]
         model: Any = AutoModelForCausalLM.from_pretrained(model_name)
         model.to(device)
         model.eval()
