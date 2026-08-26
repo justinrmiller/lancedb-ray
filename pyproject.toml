@@ -88,8 +88,10 @@ branch = true
 # because some installed stubs (numpy) use syntax newer than our floor.
 # Ruff's target-version = "py312" is what enforces the language floor.
 files = ["lancedb_ray", "tests", "examples"]
-# Test helpers are imported flat (not as tests.*) so Ray workers can load them.
-mypy_path = "tests"
+# Test helpers and example modules are imported flat (not as tests.* or
+# examples.*) because Ray workers load them that way, so mypy needs the same
+# search path. Example module names are kept globally unique to match.
+mypy_path = ["tests", "examples/clip_image_search", "examples/vllm_generate_embed"]
 strict = true
 warn_unused_ignores = false
 

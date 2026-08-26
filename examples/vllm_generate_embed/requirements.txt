@@ -1,0 +1,13 @@
+# Extra dependencies for the generate-and-embed example.
+# Install with:  uv pip install -r examples/vllm_generate_embed/requirements.txt
+#
+# torch is large. For CPU-only machines the CPU wheel is much smaller:
+#   uv pip install torch --index-url https://download.pytorch.org/whl/cpu
+torch>=2.0
+transformers>=4.40
+streamlit>=1.30
+
+# --engine vllm additionally needs Ray's LLM extra and vLLM itself. Both want
+# a CUDA GPU; neither installs usefully on Apple silicon, which is why the
+# example also has a --engine transformers path.
+#   uv pip install "ray[llm]" vllm

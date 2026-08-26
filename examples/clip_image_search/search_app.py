@@ -9,7 +9,7 @@ and the query is an ordinary vector search.
 
 Run with::
 
-    streamlit run examples/clip_image_search/app.py --server.fileWatcherType none -- --uri ./demo_db
+    streamlit run examples/clip_image_search/search_app.py --server.fileWatcherType none -- --uri ./demo_db
 """
 
 from __future__ import annotations

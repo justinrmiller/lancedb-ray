@@ -255,7 +255,7 @@ def main() -> None:
 
         print(
             f"\nDone. Explore it with:\n"
-            f"  streamlit run examples/clip_image_search/app.py "
+            f"  streamlit run examples/clip_image_search/search_app.py "
             f"--server.fileWatcherType none -- "
             f"--uri {uri} --table {args.table}"
         )

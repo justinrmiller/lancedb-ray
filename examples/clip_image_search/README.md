@@ -57,7 +57,7 @@ to how many images fit in one forward pass. On a GPU, raise both and pass
 ## 2. Search
 
 ```bash
-streamlit run examples/clip_image_search/app.py --server.fileWatcherType none -- --uri ./demo_db
+streamlit run examples/clip_image_search/search_app.py --server.fileWatcherType none -- --uri ./demo_db
 ```
 
 The `--` matters: it separates Streamlit's own arguments from the script's.
