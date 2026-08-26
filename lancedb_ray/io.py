@@ -68,6 +68,20 @@ def _build_spec(
     )
 
 
+def _validate_concurrency(concurrency: Optional[int]) -> None:
+    """Reject a concurrency Ray cannot act on.
+
+    Passed through unchecked, a zero or negative value surfaces from inside
+    Ray as "`size` must be >= 1" -- naming an internal argument rather than the
+    one the caller actually set.
+    """
+    if concurrency is not None and concurrency < 1:
+        raise ValueError(
+            f"concurrency must be at least 1, got {concurrency}. Pass "
+            "concurrency=None (the default) to let Ray decide."
+        )
+
+
 def read_lancedb(
     table: str,
     *,
@@ -136,6 +150,7 @@ def read_lancedb(
     Returns:
         A Ray Dataset over the table's contents.
     """
+    _validate_concurrency(concurrency)
     spec = _build_spec(
         uri,
         api_key,
@@ -345,6 +360,7 @@ def write_lancedb(
     # Validate here rather than relying on the datasink: the fragment path does
     # not construct a datasink at all, so it would otherwise accept a bad mode
     # and fail much later with a confusing storage-level error.
+    _validate_concurrency(concurrency)
     normalized_on = validate_write_args(mode, on)
 
     if mode == "upsert" and partition_on_keys and _can_race(concurrency):

@@ -8,7 +8,7 @@ import lance
 import pyarrow as pa
 import pytest
 import ray
-from lancedb_ray import write_lancedb
+from lancedb_ray import read_lancedb, write_lancedb
 from ray.exceptions import RayTaskError
 
 from conftest import Backend, make_table
@@ -646,3 +646,39 @@ class TestFailedWriteAtomicity:
             dataset_of(make_table(400, start=1000)), "items", uri=db_dir, mode="append"
         )
         assert lance.dataset(f"{db_dir}/items.lance").count_rows() == 500
+
+
+class TestConcurrencyValidation:
+    """A concurrency Ray cannot act on should be named, not translated.
+
+    Passed through unchecked it surfaces from inside Ray as "`size` must be
+    >= 1", which names an internal argument rather than the one that was set.
+    """
+
+    @pytest.mark.parametrize("value", [0, -1, -5])
+    def test_write_rejects_non_positive_concurrency(
+        self, db_dir: str, value: int
+    ) -> None:
+        with pytest.raises(ValueError, match="concurrency must be at least 1"):
+            write_lancedb(
+                dataset_of(make_table(5)),
+                "items",
+                uri=db_dir,
+                mode="create",
+                concurrency=value,
+            )
+
+    @pytest.mark.parametrize("value", [0, -2])
+    def test_read_rejects_non_positive_concurrency(
+        self, seeded_local: tuple[str, pa.Table], value: int
+    ) -> None:
+        db_dir, _ = seeded_local
+        with pytest.raises(ValueError, match="concurrency must be at least 1"):
+            read_lancedb("items", uri=db_dir, concurrency=value)
+
+    def test_none_and_positive_values_are_accepted(
+        self, seeded_local: tuple[str, pa.Table]
+    ) -> None:
+        db_dir, _ = seeded_local
+        assert read_lancedb("items", uri=db_dir, concurrency=None).count() == 100
+        assert read_lancedb("items", uri=db_dir, concurrency=2).count() == 100
