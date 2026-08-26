@@ -68,10 +68,20 @@ def _build_block_metadata(
 
 
 def _apply_columns(query: Any, columns: Optional[list[str]]) -> Any:
-    """Apply a column projection to a query builder, if one was requested."""
-    if columns:
-        return query.select(columns)
-    return query
+    """Apply a column projection to a query builder, if one was requested.
+
+    ``None`` means no projection; an empty list is a caller mistake rather than
+    a request for nothing, and silently returning every column would be the
+    opposite of what was asked for.
+    """
+    if columns is None:
+        return query
+    if not columns:
+        raise ValueError(
+            "columns=[] selects no columns. Pass columns=None (the default) to "
+            "read every column, or name the ones you want."
+        )
+    return query.select(columns)
 
 
 def _empty_table(schema: Optional[pa.Schema]) -> pa.Table:

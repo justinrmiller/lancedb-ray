@@ -55,6 +55,33 @@ def is_transient(error: BaseException) -> bool:
     return any(marker in message for marker in _TRANSIENT_MARKERS)
 
 
+#: Failures that mean the request never reached the service, or was rejected
+#: without being applied. Re-sending these cannot duplicate anything.
+_NOT_APPLIED_MARKERS = (
+    "connection refused",
+    "temporarily unavailable",
+    "service unavailable",
+    "too many requests",
+    "429",
+    "503",
+    "name or service not known",
+    "nodename nor servname",
+    "failed to resolve",
+)
+
+
+def is_definitely_not_applied(error: BaseException) -> bool:
+    """Whether ``error`` proves the write never took effect.
+
+    A read timeout or a dropped connection is ambiguous: the service may have
+    committed and only the response was lost. Re-sending a non-idempotent
+    append in that case silently duplicates rows, so appends retry only on
+    this narrower class.
+    """
+    message = str(error).lower()
+    return any(marker in message for marker in _NOT_APPLIED_MARKERS)
+
+
 def is_commit_conflict(error: BaseException) -> bool:
     """Return whether ``error`` looks like a losing race on a dataset commit."""
     message = str(error).lower()

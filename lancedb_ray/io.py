@@ -254,6 +254,18 @@ def write_lancedb(
     many tasks participated. Upserts and all Cloud/Enterprise writes go through
     LanceDB's table API instead.
 
+    Delivery semantics:
+        Appends are at-least-once, not exactly-once. If the service commits a
+        write and the response is then lost, no client can tell that apart from
+        a write that never landed, and re-sending duplicates every row in the
+        batch. The default retry policy narrows this considerably -- appends
+        retry only when the failure proves nothing was applied -- but it cannot
+        remove it, and neither can any layer above LanceDB without an
+        idempotency key.
+
+        For exactly-once, use ``mode="upsert"`` with ``on=`` naming a key.
+        Merge-insert is idempotent: replaying it converges on the same table.
+
     Examples:
         Distributed local append::
 
@@ -297,6 +309,12 @@ def write_lancedb(
             rows -- ``True`` for all, or a predicate string to restrict them.
         on_batch_error: ``raise`` (default) or ``skip``. ``skip`` drops batches
             that fail after retries, which trades data loss for job completion.
+        retry_policy: Retry behaviour for a failed write. The default depends
+            on ``mode``, because ``add`` is not idempotent and ``merge_insert``
+            is: appends retry only on failures that prove nothing was applied
+            (a refused connection, a rate-limit rejection), while upserts also
+            retry ambiguous ones such as a read timeout. See the note on
+            delivery semantics below.
         local_write_strategy: ``auto`` (default) uses the fragment path where it
             applies; ``fragment`` forces it; ``api`` forces the table API.
         max_rows_per_file: Fragment sizing for the fragment path.

@@ -23,7 +23,13 @@ from ray.data.datasource import Datasink
 from ray.data.datasource.datasink import WriteResult
 
 from ._plan import split_arrow_table
-from ._retry import RetryPolicy, call_with_retry, is_commit_conflict, is_transient
+from ._retry import (
+    RetryPolicy,
+    call_with_retry,
+    is_commit_conflict,
+    is_definitely_not_applied,
+    is_transient,
+)
 from .connection import LanceDBConnectionSpec, connect, list_table_names
 
 if TYPE_CHECKING:
@@ -77,9 +83,23 @@ class WriteStats:
         )
 
 
-def _retry_predicate(error: BaseException) -> bool:
-    """Retry both remote flakiness and lost races on the local commit lock."""
+def _idempotent_retry_predicate(error: BaseException) -> bool:
+    """Retry freely: merge-insert is keyed, so re-applying it changes nothing."""
     return is_transient(error) or is_commit_conflict(error)
+
+
+def _append_retry_predicate(error: BaseException) -> bool:
+    """Retry an append only when the write provably did not land.
+
+    ``add`` is not idempotent. A read timeout or a dropped connection is
+    ambiguous -- the service may have committed and only the response was lost
+    -- so re-sending duplicates every row in the batch, silently. Appends
+    therefore retry only on failures that prove nothing was applied, such as a
+    refused connection or a rate-limit rejection. Ray does not paper over this
+    either: ``retried_map_errors`` is false by default, so a raised error is
+    surfaced rather than replayed.
+    """
+    return is_definitely_not_applied(error) or is_commit_conflict(error)
 
 
 def _align_to_schema(block: pa.Table, schema: pa.Schema) -> pa.Table:
@@ -181,7 +201,12 @@ class LanceDBDatasink(Datasink[WriteStats]):
         self._when_not_matched_insert_all = when_not_matched_insert_all
         self._when_not_matched_by_source_delete = when_not_matched_by_source_delete
         self._on_batch_error: OnBatchError = on_batch_error
-        self._retry_policy = retry_policy or RetryPolicy(predicate=_retry_predicate)
+        if retry_policy is not None:
+            self._retry_policy = retry_policy
+        elif mode == "upsert":
+            self._retry_policy = RetryPolicy(predicate=_idempotent_retry_predicate)
+        else:
+            self._retry_policy = RetryPolicy(predicate=_append_retry_predicate)
 
     def get_name(self) -> str:
         return f"LanceDB({self._table_name})"

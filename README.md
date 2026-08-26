@@ -160,6 +160,14 @@ that to be true.
 
 ## Other notes and trade-offs
 
+- **Appends are at-least-once; upserts are exactly-once.** If LanceDB commits a
+  write and the response is lost, no client can distinguish that from a write
+  that never landed, so a retry duplicates the batch. The default retry policy
+  narrows the window — an append retries only on failures that prove nothing was
+  applied, such as a refused connection or a rate-limit rejection, while an
+  upsert also retries ambiguous ones like a read timeout because merge-insert is
+  idempotent. If you need exactly-once, write with `mode="upsert"` and an `on`
+  key; replaying it converges on the same table.
 - **`on_batch_error` defaults to `raise`.** Logging a failed write and continuing lets a
   job report success while having silently lost data. `skip` is available when partial
   completion genuinely is preferable, and dropped rows are counted and warned about.

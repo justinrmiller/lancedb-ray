@@ -15,7 +15,7 @@ from lancedb_ray._retry import RetryPolicy
 from lancedb_ray.connection import LanceDBConnectionSpec
 from lancedb_ray.datasink import LanceDBDatasink, WriteStats
 
-from _fakes import FlakyRemoteTable
+from _fakes import FakeRemoteTable, FlakyRemoteTable
 from conftest import make_table
 
 
@@ -369,12 +369,49 @@ class TestUpsertBuilderOptions:
         assert table.count_rows() == 100
 
 
-def test_retry_predicate_covers_transient_and_commit_conflicts() -> None:
-    from lancedb_ray.datasink import _retry_predicate
+class TestRetryPredicates:
+    """Appends are not idempotent; upserts are. The predicates differ for that
+    reason, and getting it backwards duplicates data silently."""
 
-    assert _retry_predicate(TimeoutError("connection timed out"))
-    assert _retry_predicate(RuntimeError("commit conflict detected"))
-    assert not _retry_predicate(ValueError("schema mismatch"))
+    def test_upserts_retry_ambiguous_failures(self) -> None:
+        from lancedb_ray.datasink import _idempotent_retry_predicate as predicate
+
+        assert predicate(TimeoutError("connection timed out"))
+        assert predicate(RuntimeError("commit conflict detected"))
+        assert not predicate(ValueError("schema mismatch"))
+
+    def test_appends_do_not_retry_ambiguous_failures(self) -> None:
+        from lancedb_ray.datasink import _append_retry_predicate as predicate
+
+        # Ambiguous: the service may have committed and only the reply was
+        # lost, so re-sending would duplicate every row in the batch.
+        assert not predicate(TimeoutError("connection timed out"))
+        assert not predicate(RuntimeError("504 Gateway Timeout"))
+        assert not predicate(ConnectionResetError("connection reset by peer"))
+
+    def test_appends_retry_when_nothing_was_applied(self) -> None:
+        from lancedb_ray.datasink import _append_retry_predicate as predicate
+
+        assert predicate(ConnectionRefusedError("connection refused"))
+        assert predicate(RuntimeError("429 Too Many Requests"))
+        assert predicate(RuntimeError("503 Service Unavailable"))
+        assert predicate(RuntimeError("commit conflict detected"))
+        assert not predicate(ValueError("schema mismatch"))
+
+    def test_the_datasink_picks_the_predicate_by_mode(
+        self, spec: LanceDBConnectionSpec
+    ) -> None:
+        append = LanceDBDatasink(spec, "items", mode="append")
+        upsert = LanceDBDatasink(spec, "items", mode="upsert", on="id")
+
+        ambiguous = TimeoutError("connection timed out")
+        assert not append._retry_policy.predicate(ambiguous)
+        assert upsert._retry_policy.predicate(ambiguous)
+
+    def test_an_explicit_policy_still_wins(self, spec: LanceDBConnectionSpec) -> None:
+        policy = RetryPolicy(predicate=lambda _: True)
+        sink = LanceDBDatasink(spec, "items", mode="append", retry_policy=policy)
+        assert sink._retry_policy is policy
 
 
 class RecordingTable:
@@ -460,3 +497,81 @@ class TestSchemaAlignmentAcrossBlocks:
 
         table = make_table(3)
         assert _align_to_schema(table, table.schema) is table
+
+
+class CommitsThenFails(FlakyRemoteTable):
+    """A write that lands server-side but whose response is lost.
+
+    The failure mode no client can distinguish from a write that never
+    happened, and the reason appends cannot be blindly retried.
+    """
+
+    def __init__(self, inner: Any, name: str, error: BaseException) -> None:
+        super().__init__(inner, name, failures=0)
+        self.error = error
+        self.calls = 0
+
+    def add(self, data: Any, **kwargs: Any) -> Any:
+        self.calls += 1
+        result = FakeRemoteTable.add(self, data, **kwargs)
+        if self.calls == 1:
+            raise self.error
+        return result
+
+
+class TestAtLeastOnceBoundary:
+    """Retrying an append after an ambiguous failure duplicates every row.
+
+    ``add`` is not idempotent, so this is a correctness boundary rather than a
+    tuning knob: the default policy retries an append only when the failure
+    proves nothing was applied.
+    """
+
+    def _handle(self, spec: LanceDBConnectionSpec, error: BaseException) -> Any:
+        db = lancedb.connect(spec.uri, **spec.connect_kwargs())
+        inner: Any = db.open_table("items")
+        return CommitsThenFails(inner._inner, "items", error)
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            TimeoutError("connection timed out"),
+            ConnectionResetError("connection reset by peer"),
+            RuntimeError("504 Gateway Timeout"),
+        ],
+    )
+    def test_ambiguous_failure_does_not_duplicate(
+        self, seeded_spec: LanceDBConnectionSpec, error: BaseException
+    ) -> None:
+        handle = self._handle(seeded_spec, error)
+        sink = LanceDBDatasink(seeded_spec, "items", mode="append")
+        arrow = make_table(10)
+
+        with pytest.raises(type(error)):
+            write_arrow(sink, handle, arrow, WriteStats())
+
+        # One attempt only: the rows landed once, and the error is surfaced
+        # rather than replayed into a second copy.
+        assert handle.calls == 1
+
+    def test_a_failure_that_proves_nothing_landed_is_retried(
+        self, seeded_spec: LanceDBConnectionSpec
+    ) -> None:
+        db = lancedb.connect(seeded_spec.uri, **seeded_spec.connect_kwargs())
+        inner: Any = db.open_table("items")
+        handle = FlakyRemoteTable(
+            inner._inner,
+            "items",
+            failures=1,
+            error=ConnectionRefusedError("connection refused"),
+        )
+        sink = LanceDBDatasink(
+            seeded_spec, "items", mode="append", retry_policy=no_sleep_policy()
+        )
+        # The default append predicate must still accept this class of error.
+        assert LanceDBDatasink(
+            seeded_spec, "items", mode="append"
+        )._retry_policy.predicate(ConnectionRefusedError("connection refused"))
+
+        write_arrow(sink, handle, make_table(10), WriteStats())
+        assert handle.attempts == 2
