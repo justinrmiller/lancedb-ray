@@ -40,18 +40,53 @@ API_KEY_ENV_VAR = "LANCEDB_API_KEY"
 _Frozen = tuple[tuple[str, Any], ...]
 
 
+#: Tags marking a frozen container so it can be rebuilt. The NUL prefix keeps
+#: them from colliding with a real configuration value.
+_DICT_TAG = "\x00lancedb_ray.dict"
+_LIST_TAG = "\x00lancedb_ray.list"
+
+
+def _freeze_value(value: Any) -> Any:
+    """Recursively convert a value into something hashable.
+
+    Freezing only the top level is not enough: LanceDB's ``client_config`` is
+    documented as nested (``retry_config``, ``timeout_config``, ``tls_config``),
+    so a realistic connection would leave a bare dict inside the spec and fail
+    to hash with a message that names neither the option nor the cause.
+    """
+    if isinstance(value, Mapping):
+        return (
+            _DICT_TAG,
+            tuple(sorted((str(k), _freeze_value(v)) for k, v in value.items())),
+        )
+    if isinstance(value, (list, tuple)):
+        return (_LIST_TAG, tuple(_freeze_value(item) for item in value))
+    return value
+
+
+def _thaw_value(value: Any) -> Any:
+    """Invert :func:`_freeze_value`."""
+    if isinstance(value, tuple) and len(value) == 2:
+        tag, payload = value
+        if tag == _DICT_TAG:
+            return {key: _thaw_value(item) for key, item in payload}
+        if tag == _LIST_TAG:
+            return [_thaw_value(item) for item in payload]
+    return value
+
+
 def _freeze(mapping: Optional[Mapping[str, Any]]) -> Optional[_Frozen]:
     """Convert a mapping into a hashable, order-independent tuple of pairs."""
     if mapping is None:
         return None
-    return tuple(sorted((str(k), v) for k, v in mapping.items()))
+    return tuple(sorted((str(k), _freeze_value(v)) for k, v in mapping.items()))
 
 
 def _thaw(frozen: Optional[_Frozen]) -> Optional[dict[str, Any]]:
     """Rebuild a mutable dict from :func:`_freeze` output."""
     if frozen is None:
         return None
-    return dict(frozen)
+    return {key: _thaw_value(value) for key, value in frozen}
 
 
 @dataclass(frozen=True)
@@ -110,8 +145,14 @@ class LanceDBConnectionSpec:
 
     @property
     def is_remote(self) -> bool:
-        """Whether this spec points at LanceDB Cloud / Enterprise."""
-        return self.uri.startswith(REMOTE_URI_PREFIX)
+        """Whether this spec points at LanceDB Cloud / Enterprise.
+
+        Matched case-insensitively and ignoring surrounding whitespace: getting
+        this wrong silently routes the write down the local fragment path,
+        which then fails while trying to treat ``DB://name`` as a filesystem
+        path rather than saying the URI was not understood.
+        """
+        return self.uri.strip().lower().startswith(REMOTE_URI_PREFIX)
 
     @property
     def storage_options(self) -> Optional[dict[str, Any]]:

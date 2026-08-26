@@ -82,6 +82,33 @@ def _retry_predicate(error: BaseException) -> bool:
     return is_transient(error) or is_commit_conflict(error)
 
 
+def _align_to_schema(block: pa.Table, schema: pa.Schema) -> pa.Table:
+    """Reorder a block's columns to match ``schema``.
+
+    A task hands every block to LanceDB through one ``RecordBatchReader``, which
+    carries a single schema. Ray does not promise that blocks in a dataset share
+    a column *order* -- ``from_arrow`` with differently-ordered tables, or a
+    ``map_batches`` returning dicts built in varying order, both produce it. If
+    a block's fields are in a different order than the declared schema, its
+    buffers are read against the wrong fields, which surfaces as an opaque Arrow
+    C data interface error rather than anything mentioning columns.
+
+    Raises:
+        ValueError: If the block is missing a column the schema requires, which
+            is a genuine mismatch rather than an ordering difference.
+    """
+    if block.schema.names == schema.names:
+        return block
+
+    missing = [name for name in schema.names if name not in block.schema.names]
+    if missing:
+        raise ValueError(
+            f"Block is missing column(s) {missing} required by the write "
+            f"schema {schema.names}. All blocks in a write must share a schema."
+        )
+    return block.select(list(schema.names))
+
+
 class LanceDBDatasink(Datasink[WriteStats]):
     """Write a Ray :class:`~ray.data.Dataset` into a LanceDB table.
 
@@ -243,6 +270,8 @@ class LanceDBDatasink(Datasink[WriteStats]):
                 continue
             if schema is None:
                 schema = arrow_block.schema
+            else:
+                arrow_block = _align_to_schema(arrow_block, schema)
             batches.extend(arrow_block.to_batches())
             num_rows += arrow_block.num_rows
 

@@ -417,3 +417,79 @@ class TestTableListingFallbacks:
         db = Paginated()
         assert list_table_names(db) == ["one", "two", "three"]  # type: ignore[arg-type]
         assert db.tokens_seen == [None, "next"]
+
+
+class TestNestedConfiguration:
+    """LanceDB's ClientConfig is documented as nested.
+
+    Freezing only the top level left a bare dict inside the spec, so the very
+    first realistic Enterprise connection -- one that sets a timeout or a retry
+    policy -- died with ``TypeError: unhashable type: 'dict'`` naming neither
+    the option nor the cause.
+    """
+
+    NESTED = {
+        "retry_config": {"retries": 5, "statuses": [429, 503]},
+        "timeout_config": {"connect_timeout": 5},
+    }
+
+    def _spec(self, **overrides: Any) -> LanceDBConnectionSpec:
+        config = overrides.pop("client_config", self.NESTED)
+        return LanceDBConnectionSpec.create(
+            "db://x", api_key="k", client_config=config, **overrides
+        )
+
+    def test_nested_mapping_is_hashable(self) -> None:
+        assert isinstance(hash(self._spec()), int)
+
+    def test_nested_mapping_round_trips_exactly(self) -> None:
+        assert self._spec().client_config == self.NESTED
+
+    def test_nested_lists_survive(self) -> None:
+        config = self._spec().client_config
+        assert config is not None
+        assert config["retry_config"]["statuses"] == [429, 503]
+
+    def test_key_order_does_not_change_identity(self) -> None:
+        reordered = {
+            "timeout_config": {"connect_timeout": 5},
+            "retry_config": {"statuses": [429, 503], "retries": 5},
+        }
+        assert hash(self._spec()) == hash(self._spec(client_config=reordered))
+
+    def test_a_differing_nested_value_is_a_different_spec(self) -> None:
+        other = {"retry_config": {"retries": 6}}
+        assert self._spec() != self._spec(client_config=other)
+
+    def test_survives_pickling(self) -> None:
+        import pickle
+
+        spec = self._spec()
+        restored = pickle.loads(pickle.dumps(spec))
+        assert restored == spec
+        assert restored.connect_kwargs()["client_config"] == self.NESTED
+
+    def test_deeply_nested_storage_options(self) -> None:
+        deep = {"a": {"b": {"c": [1, {"d": 2}]}}}
+        spec = LanceDBConnectionSpec.create("/db", storage_options=deep)
+        assert isinstance(hash(spec), int)
+        assert spec.storage_options == deep
+
+
+class TestUriSchemeNormalisation:
+    """Backend routing must not hinge on exact casing or stray whitespace.
+
+    Getting it wrong sends a Cloud/Enterprise write down the local fragment
+    path, which then fails trying to treat ``DB://name`` as a filesystem path
+    rather than reporting an unusable URI.
+    """
+
+    @pytest.mark.parametrize("uri", ["db://x", "DB://x", "Db://x", "  db://x  "])
+    def test_recognised_as_remote(self, uri: str) -> None:
+        assert LanceDBConnectionSpec.create(uri).is_remote
+
+    @pytest.mark.parametrize(
+        "uri", ["/data/db", "s3://bucket/db", "./rel", "gs://b/db"]
+    )
+    def test_still_local(self, uri: str) -> None:
+        assert not LanceDBConnectionSpec.create(uri).is_remote

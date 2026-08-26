@@ -422,3 +422,41 @@ class TestWriteParallelism:
         # client stream the rows as multiple parts under one upload.
         assert isinstance(table.readers[0], pa.RecordBatchReader)
         assert table.readers[0].read_all().num_rows == 7
+
+
+class TestSchemaAlignmentAcrossBlocks:
+    """A task streams every block through one reader, which carries one schema.
+
+    Ray does not promise blocks share a column *order* -- ``from_arrow`` over
+    differently-ordered tables produces exactly that. Feeding a mis-ordered
+    block to a reader declared with another schema reads its buffers against
+    the wrong fields, surfacing as an opaque Arrow C data interface error that
+    mentions buffers rather than columns.
+    """
+
+    def test_reordered_columns_are_realigned(
+        self, seeded_spec: LanceDBConnectionSpec
+    ) -> None:
+        sink = LanceDBDatasink(seeded_spec, "items")
+        first = make_table(5)
+        reordered = first.select(list(reversed(first.schema.names)))
+        assert reordered.schema.names != first.schema.names
+
+        stats = sink.write(iter([first, reordered]), ctx=None)  # type: ignore[arg-type]
+
+        assert stats.num_rows == 10
+        assert stats.num_batches == 1
+
+    def test_a_missing_column_is_reported_clearly(self) -> None:
+        from lancedb_ray.datasink import _align_to_schema
+
+        full = make_table(3)
+        dropped = full.drop_columns(["label"])
+        with pytest.raises(ValueError, match="missing column"):
+            _align_to_schema(dropped, full.schema)
+
+    def test_matching_order_is_passed_through_untouched(self) -> None:
+        from lancedb_ray.datasink import _align_to_schema
+
+        table = make_table(3)
+        assert _align_to_schema(table, table.schema) is table
