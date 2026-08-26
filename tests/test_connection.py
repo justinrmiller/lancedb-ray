@@ -281,3 +281,21 @@ def test_table_dataset_uri_returns_the_backing_dataset(
     db_dir, _ = seeded_local
     spec = LanceDBConnectionSpec.create(db_dir)
     assert table_dataset_uri(open_table(spec, "items")).endswith("items.lance")
+
+
+def test_client_config_reaches_connect_kwargs() -> None:
+    spec = LanceDBConnectionSpec.create(
+        "db://x", api_key="k", client_config={"timeout": 30, "retries": 3}
+    )
+    assert spec.connect_kwargs()["client_config"] == {"timeout": 30, "retries": 3}
+
+
+def test_to_lance_on_an_object_without_the_method_is_refused() -> None:
+    """Not every table-like object even declares to_lance."""
+    from lancedb_ray.connection import to_lance
+
+    class NoDataset:
+        pass
+
+    with pytest.raises(TypeError, match="does not expose an underlying Lance"):
+        to_lance(NoDataset())  # type: ignore[arg-type]

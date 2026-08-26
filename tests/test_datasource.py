@@ -249,14 +249,10 @@ class TestSingleStrategyExecution:
 
 
 class TestPaginationEdgeCases:
-    def test_pagination_stops_early_on_a_short_page(
+    def test_filtered_pagination_spans_multiple_pages(
         self, spec: LanceDBConnectionSpec
     ) -> None:
-        """A page shorter than the limit means the result set ended.
-
-        Continuing to request further pages would only produce empty responses,
-        so the shard stops rather than burning round trips.
-        """
+        """A filtered shard whose rows exceed batch_size pages correctly."""
         source = LanceDBDatasource(
             spec, "items", strategy="pagination", filter="id < 7", batch_size=3
         )
@@ -287,3 +283,119 @@ class TestPaginationEdgeCases:
             for block in task():
                 ids.extend(block.column("id").to_pylist())
         assert sorted(ids) == list(range(100))
+
+
+class TestPaginationShortPage:
+    """The short-page early stop is a safety net, not a normal code path.
+
+    Shard planning is exact -- sizes come from ``count_rows(filter)`` against
+    the pinned version -- so under normal operation every page comes back full
+    and the loop simply runs out of range. The ``break`` exists for the case
+    where the server returns fewer rows than asked for anyway, and reaching it
+    requires a server that does exactly that.
+    """
+
+    def test_a_short_page_stops_further_requests(
+        self, spec: LanceDBConnectionSpec, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from lancedb_ray import datasource as ds_mod
+        from lancedb_ray._plan import OffsetRange
+        from lancedb_ray._retry import RetryPolicy
+
+        requests: list[tuple[int, int]] = []
+
+        class ShortPageQuery:
+            def __init__(self) -> None:
+                self._offset = 0
+                self._limit = 0
+
+            def where(self, _predicate: str) -> ShortPageQuery:
+                return self
+
+            def select(self, _columns: list[str]) -> ShortPageQuery:
+                return self
+
+            def offset(self, value: int) -> ShortPageQuery:
+                self._offset = value
+                return self
+
+            def limit(self, value: int) -> ShortPageQuery:
+                self._limit = value
+                return self
+
+            def to_arrow(self) -> pa.Table:
+                requests.append((self._offset, self._limit))
+                # Always return one row fewer than requested.
+                rows = max(self._limit - 1, 0)
+                return pa.table({"id": pa.array(range(rows), pa.int64())})
+
+        class ShortPageTable:
+            def search(self, _query: object = None) -> ShortPageQuery:
+                return ShortPageQuery()
+
+        monkeypatch.setattr(ds_mod, "open_table", lambda *a, **k: ShortPageTable())
+
+        blocks = list(
+            ds_mod._read_pagination(
+                spec,
+                "items",
+                1,
+                OffsetRange(0, 100),
+                None,
+                None,
+                10,
+                RetryPolicy(max_attempts=1),
+                None,
+            )
+        )
+
+        # Without the early stop this would issue ten requests.
+        assert requests == [(0, 10)]
+        assert sum(b.num_rows for b in blocks) == 9
+
+    def test_an_immediately_empty_page_still_yields_a_block(
+        self, spec: LanceDBConnectionSpec, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from lancedb_ray import datasource as ds_mod
+        from lancedb_ray._plan import OffsetRange
+        from lancedb_ray._retry import RetryPolicy
+
+        schema = pa.schema([pa.field("id", pa.int64())])
+
+        class EmptyQuery:
+            def where(self, _p: str) -> EmptyQuery:
+                return self
+
+            def offset(self, _v: int) -> EmptyQuery:
+                return self
+
+            def limit(self, _v: int) -> EmptyQuery:
+                return self
+
+            def to_arrow(self) -> pa.Table:
+                return pa.table({"id": pa.array([], pa.int64())})
+
+        class EmptyTable:
+            def search(self, _query: object = None) -> EmptyQuery:
+                return EmptyQuery()
+
+        monkeypatch.setattr(ds_mod, "open_table", lambda *a, **k: EmptyTable())
+
+        blocks = list(
+            ds_mod._read_pagination(
+                spec,
+                "items",
+                1,
+                OffsetRange(0, 50),
+                None,
+                None,
+                10,
+                RetryPolicy(max_attempts=1),
+                schema,
+            )
+        )
+
+        # Ray needs at least one block to infer a schema for the Dataset.
+        assert len(blocks) == 1
+        assert blocks[0].num_rows == 0
+        assert blocks[0].schema == schema
