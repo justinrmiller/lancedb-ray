@@ -5,5 +5,9 @@
 #   uv pip install torch --index-url https://download.pytorch.org/whl/cpu
 torch>=2.0
 transformers>=4.40
+# torchvision is NOT required: the example loads CLIPModel/CLIPProcessor by
+# name, avoiding transformers' Auto* registry lookup, which can otherwise pull
+# in torchvision-backed image processors for unrelated models. If some other
+# transformers path still demands it, `uv pip install torchvision` fixes it.
 pillow>=10.0
 streamlit>=1.30

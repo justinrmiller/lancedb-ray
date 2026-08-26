@@ -130,3 +130,11 @@ photos, re-run the ingestion.
 
 **Unreadable files are skipped, not fatal.** A corrupt JPEG logs a warning and
 the job continues rather than losing an entire batch.
+
+**CLIP is loaded by class name, not through `AutoModel`.** The `Auto*` classes
+resolve through transformers' model registry, and that lookup can route via
+`AutoImageProcessor` and import image-processing modules for entirely unrelated
+models — several of which require `torchvision` and fail with
+`ModuleNotFoundError: No module named 'torchvision'` even though CLIP never
+needs it. Naming `CLIPModel` and `CLIPProcessor` skips the registry, so the
+example runs without torchvision installed (and loads a little faster).

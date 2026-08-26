@@ -29,12 +29,20 @@ EMBEDDING_DIM = 512
 
 def load_clip(model_name: str = DEFAULT_MODEL, device: str = "cpu") -> tuple[Any, Any]:
     """Load a CLIP model and its processor, ready for inference."""
-    from transformers import AutoModel, AutoProcessor
+    from transformers import CLIPModel, CLIPProcessor
 
-    # transformers ships incomplete annotations for the auto classes; the
-    # returned objects are used dynamically here in any case.
-    processor = AutoProcessor.from_pretrained(model_name)  # type: ignore[no-untyped-call]
-    model = AutoModel.from_pretrained(model_name)
+    # Load the concrete CLIP classes rather than AutoModel/AutoProcessor. The
+    # Auto* classes resolve through transformers' model registry, which can
+    # route via AutoImageProcessor and import unrelated model modules -- several
+    # of which require torchvision and raise ModuleNotFoundError when it is not
+    # installed, even though CLIP itself never needs it. Naming the classes
+    # skips that discovery entirely, and is faster besides.
+    # Annotated Any deliberately: transformers' own annotations vary between
+    # versions (and are absent entirely when it is not installed, as in lint
+    # CI), so type-checking these calls would pass in one environment and fail
+    # in the other. Everything below uses the objects dynamically anyway.
+    processor: Any = CLIPProcessor.from_pretrained(model_name)
+    model: Any = CLIPModel.from_pretrained(model_name)
     model.to(device)
     model.eval()
     return model, processor
