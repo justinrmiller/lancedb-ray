@@ -38,10 +38,10 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    # A deadlocked Ray/LanceDB worker otherwise holds the runner until the
+    # six-hour default; pytest's own --timeout should fire first and print
+    # tracebacks, and this is the backstop.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
@@ -49,7 +49,7 @@ jobs:
           enable-cache: true
       - name: Create environment
         run: |
-          uv venv --python ${{ matrix.python-version }}
+          uv venv --python 3.12
           echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
       - name: Install
         run: uv pip install -e ".[dev]"

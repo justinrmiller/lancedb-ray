@@ -7,7 +7,7 @@ name = "lancedb-ray"
 version = "0.1.0"
 description = "Ray Data integration for LanceDB and LanceDB Enterprise"
 readme = "README.md"
-requires-python = ">=3.10,<3.14"
+requires-python = ">=3.12"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 authors = [{ name = "Justin Miller" }]
@@ -17,14 +17,11 @@ classifiers = [
     "Intended Audience :: Developers",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
-    "Programming Language :: Python :: 3.13",
 ]
 
 dependencies = [
-    "ray[data]>=2.41.0",
+    "ray[data]>=2.51.0",
     "lancedb>=0.24.0",
     "lance-ray>=0.5.0",
     "pyarrow>=17.0.0",
@@ -35,6 +32,7 @@ dev = [
     "pytest>=8.4.0",
     "pytest-cov>=5.0.0",
     "pytest-xdist>=3.6.0",
+    "pytest-timeout>=2.3.0",
     "mypy>=1.11.0",
     "ruff>=0.8.0",
     "pandas>=2.0.0",
@@ -50,7 +48,7 @@ include = ["lancedb_ray*"]
 
 [tool.ruff]
 line-length = 88
-target-version = "py310"
+target-version = "py312"
 src = ["lancedb_ray", "tests", "examples"]
 
 [tool.ruff.lint]
@@ -62,7 +60,16 @@ quote-style = "double"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = ["--cov=lancedb_ray", "--cov-report=term-missing", "--cov-fail-under=90"]
+addopts = [
+    "--cov=lancedb_ray",
+    "--cov-report=term-missing",
+    "--cov-fail-under=90",
+    # Ray forks workers and LanceDB's async runtime is only experimentally
+    # fork-safe, so a task can deadlock. Fail the test with thread tracebacks
+    # instead of stalling the run until the CI job is killed.
+    "--timeout=300",
+    "--timeout-method=thread",
+]
 markers = [
     "enterprise: live tests against a real LanceDB Cloud/Enterprise endpoint (needs LANCEDB_URI + LANCEDB_API_KEY)",
 ]
@@ -74,7 +81,7 @@ omit = ["*/tests/*"]
 [tool.mypy]
 # No python_version pin: it must match the interpreter actually running mypy,
 # because some installed stubs (numpy) use syntax newer than our floor.
-# Ruff's target-version = "py310" is what enforces the language floor.
+# Ruff's target-version = "py312" is what enforces the language floor.
 files = ["lancedb_ray", "tests", "examples"]
 # Test helpers are imported flat (not as tests.*) so Ray workers can load them.
 mypy_path = "tests"
@@ -83,4 +90,11 @@ warn_unused_ignores = false
 
 [[tool.mypy.overrides]]
 module = ["lancedb.*", "lance.*", "lance_ray.*", "ray.*", "pyarrow.*", "pandas.*"]
+ignore_missing_imports = true
+
+# The clip_image_search example's dependencies are deliberately not part of
+# [dev]: they are large (torch alone is hundreds of MB) and only that one
+# example needs them. Lint must therefore pass without them installed.
+[[tool.mypy.overrides]]
+module = ["torch.*", "transformers.*", "PIL.*", "streamlit.*"]
 ignore_missing_imports = true

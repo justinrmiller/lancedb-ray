@@ -12,11 +12,8 @@ import logging
 import random
 import time
 from collections.abc import Callable
-from typing import TypeVar
 
 logger = logging.getLogger(__name__)
-
-T = TypeVar("T")
 
 __all__ = ["RetryPolicy", "call_with_retry", "is_commit_conflict", "is_transient"]
 
@@ -95,7 +92,7 @@ class RetryPolicy:
         return random.uniform(0.0, min(uncapped, self.max_backoff_s))
 
 
-def call_with_retry(
+def call_with_retry[T](
     fn: Callable[[], T],
     policy: RetryPolicy,
     *,

@@ -47,13 +47,13 @@ def parse_args() -> argparse.Namespace:
     return known
 
 
-@st.cache_resource
+@st.cache_resource  # type: ignore[untyped-decorator]
 def get_model(model_name: str) -> tuple[Any, Any]:
     """Load CLIP once per Streamlit session, not once per keystroke."""
     return load_clip(model_name)
 
 
-@st.cache_resource
+@st.cache_resource  # type: ignore[untyped-decorator]
 def get_table(uri: str, table_name: str) -> Any:
     return lancedb.connect(uri).open_table(table_name)
 

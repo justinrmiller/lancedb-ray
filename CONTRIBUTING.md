@@ -15,7 +15,7 @@ make lint    # ruff check + format check + mypy (strict)
 make fix     # auto-fix and format
 ```
 
-All three must pass before a PR merges. CI runs the suite on Python 3.10–3.13.
+All three must pass before a PR merges. CI runs the suite on Python 3.12.
 
 ## Testing against both backends
 

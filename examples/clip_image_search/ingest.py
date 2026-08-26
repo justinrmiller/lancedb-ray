@@ -34,7 +34,12 @@ import pyarrow as pa
 import ray
 from lancedb_ray import write_lancedb
 
-sys.path.insert(0, str(Path(__file__).parent))
+#: This directory is put on the driver's path for the imports below, and is
+#: also shipped to Ray workers as the job's working_dir (see main) -- the
+#: embedder class is constructed on a worker, so ``embedding`` has to be
+#: importable there too, not just here.
+EXAMPLE_DIR = Path(__file__).parent.resolve()
+sys.path.insert(0, str(EXAMPLE_DIR))
 
 from embedding import (  # noqa: E402
     DEFAULT_MODEL,
@@ -190,12 +195,24 @@ def main() -> None:
     if not directory.is_dir():
         raise SystemExit(f"Not a directory: {directory}")
 
+    # Resolve before Ray starts. Workers run with the job's working_dir as
+    # their cwd, so a relative --uri would otherwise be interpreted against a
+    # different directory on the driver and on each worker.
+    uri = str(Path(args.uri).expanduser().resolve())
+
     total = count_images(directory)
     if total == 0:
         raise SystemExit(f"No JPGs found under {directory}")
     print(f"Found {total:,} JPGs under {directory}")
 
-    ray.init(ignore_reinit_error=True, include_dashboard=False)
+    # working_dir ships this directory to the workers and puts it on their
+    # Python path, so the ClipEmbedder actor can import ``embedding`` wherever
+    # it is constructed -- including on a cluster that never saw this file.
+    ray.init(
+        ignore_reinit_error=True,
+        include_dashboard=False,
+        runtime_env={"working_dir": str(EXAMPLE_DIR)},
+    )
     started = time.perf_counter()
     try:
         # Distributed read: workers pull the bytes, not the driver.
@@ -214,12 +231,12 @@ def main() -> None:
         write_lancedb(
             embedded,
             args.table,
-            uri=args.uri,
+            uri=uri,
             mode="overwrite",
             schema=build_schema(),
         )
 
-        table = lancedb.connect(args.uri).open_table(args.table)
+        table = lancedb.connect(uri).open_table(args.table)
         num_rows = table.count_rows()
         elapsed = time.perf_counter() - started
         print(f"  embedded and wrote {num_rows:,} images in {elapsed:.1f}s")
@@ -230,7 +247,7 @@ def main() -> None:
         print(
             f"\nDone. Explore it with:\n"
             f"  streamlit run examples/clip_image_search/app.py -- "
-            f"--uri {args.uri} --table {args.table}"
+            f"--uri {uri} --table {args.table}"
         )
     finally:
         ray.shutdown()
