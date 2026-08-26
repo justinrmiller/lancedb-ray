@@ -10,7 +10,7 @@ that make the local write path worth using:
 
 Run with::
 
-    python examples/quickstart.py
+    python examples/quickstart/quickstart.py
 """
 
 from __future__ import annotations

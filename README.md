@@ -99,6 +99,16 @@ Requires Python 3.10–3.13.
 | `write_parallelism` | Parts the client uploads concurrently within one transaction |
 | `when_matched_update_all`, `when_not_matched_insert_all`, `when_not_matched_by_source_delete` | Merge-insert semantics |
 
+## Examples
+
+Each example lives in its own directory with a README of its own — see
+[`examples/`](examples/).
+
+| Example | What it shows |
+| --- | --- |
+| [`quickstart/`](examples/quickstart/) | The core guarantees on synthetic data: a write fans out across Ray tasks yet lands as one atomic commit, and reads come back fragment-parallel. No extra dependencies. |
+| [`clip_image_search/`](examples/clip_image_search/) | A realistic pipeline — scan a directory of JPGs, embed them with CLIP across Ray, write to LanceDB, build a vector index, then search them in plain English from a Streamlit app. |
+
 ## Two traps this library avoids
 
 These are easy to get wrong when writing to LanceDB from a distributed engine, and both
