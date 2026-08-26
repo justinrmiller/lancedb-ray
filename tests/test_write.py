@@ -9,6 +9,7 @@ import pyarrow as pa
 import pytest
 import ray
 from lancedb_ray import write_lancedb
+from ray.exceptions import RayTaskError
 
 from conftest import Backend, make_table
 
@@ -591,3 +592,57 @@ class TestEmptyCreate:
                 )
         finally:
             lance_ray.write_lance = original  # type: ignore[assignment]
+
+
+class TestFailedWriteAtomicity:
+    """A distributed write that fails partway must not half-land.
+
+    The fragment path is the reason the README can claim atomicity: workers
+    write fragments independently and the driver commits once at the end, so a
+    task failing before that commit leaves the table exactly as it was. This is
+    the property that makes a failed job safe to simply re-run.
+    """
+
+    def _boom_after(self, threshold: int) -> Any:
+        def transform(batch: pa.Table) -> pa.Table:
+            if batch.num_rows and int(batch.column("id")[0].as_py()) >= threshold:
+                raise RuntimeError("deliberate failure in one write task")
+            return batch
+
+        return transform
+
+    def test_fragment_path_failure_commits_nothing(self, db_dir: str) -> None:
+        write_lancedb(dataset_of(make_table(100)), "items", uri=db_dir, mode="create")
+        rows_before = (
+            version_count(db_dir),
+            lance.dataset(f"{db_dir}/items.lance").count_rows(),
+        )
+
+        # Fail inside a Ray stage rather than transform_fn, which would divert
+        # the write to the API path.
+        failing = dataset_of(make_table(400, start=1000), blocks=4).map_batches(
+            self._boom_after(1300), batch_format="pyarrow"
+        )
+        with pytest.raises(RayTaskError, match="deliberate failure"):
+            write_lancedb(failing, "items", uri=db_dir, mode="append")
+
+        rows_after = (
+            version_count(db_dir),
+            lance.dataset(f"{db_dir}/items.lance").count_rows(),
+        )
+        assert rows_after == rows_before, "a failed write must not commit anything"
+
+    def test_the_table_is_still_usable_afterwards(self, db_dir: str) -> None:
+        write_lancedb(dataset_of(make_table(100)), "items", uri=db_dir, mode="create")
+
+        failing = dataset_of(make_table(400, start=1000), blocks=4).map_batches(
+            self._boom_after(1300), batch_format="pyarrow"
+        )
+        with pytest.raises(RayTaskError, match="deliberate failure"):
+            write_lancedb(failing, "items", uri=db_dir, mode="append")
+
+        # Re-running is safe precisely because nothing landed.
+        write_lancedb(
+            dataset_of(make_table(400, start=1000)), "items", uri=db_dir, mode="append"
+        )
+        assert lance.dataset(f"{db_dir}/items.lance").count_rows() == 500
