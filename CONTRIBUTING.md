@@ -10,7 +10,7 @@ uv pip install -e ".[dev]"
 ## Workflow
 
 ```bash
-make test    # pytest with coverage (gate: 90%)
+make test    # pytest with branch coverage (gate: 95%)
 make lint    # ruff check + format check + mypy (strict)
 make fix     # auto-fix and format
 ```

@@ -177,6 +177,31 @@ class TestSizeEstimation:
         large = LanceDBDatasource(spec, "large").estimate_inmemory_data_size() or 0
         assert large > small
 
+    def test_an_empty_sample_estimates_zero(
+        self, spec: LanceDBConnectionSpec, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A populated table whose sample comes back empty must not divide by zero."""
+        source = LanceDBDatasource(spec, "items")
+        assert source.num_rows > 0
+
+        class EmptySample:
+            def select(self, _columns: Any) -> EmptySample:
+                return self
+
+            def to_arrow(self) -> pa.Table:
+                return make_table(0)
+
+        class Handle:
+            schema = make_table(0).schema
+
+            def take_offsets(self, _offsets: Any) -> EmptySample:
+                return EmptySample()
+
+        monkeypatch.setattr(
+            "lancedb_ray.datasource.open_table", lambda *a, **k: Handle()
+        )
+        assert source.estimate_inmemory_data_size() == 0
+
     def test_empty_table_estimates_zero(
         self, remote_uri: str, remote_kwargs: dict[str, Any]
     ) -> None:
@@ -399,3 +424,103 @@ class TestPaginationShortPage:
         assert len(blocks) == 1
         assert blocks[0].num_rows == 0
         assert blocks[0].schema == schema
+
+
+class TestEmptyResultPaths:
+    """A read task must always yield a block carrying the table's schema.
+
+    Yielding nothing would leave Ray to infer the schema from the remaining
+    blocks, and a read whose every shard came back empty would have no schema
+    at all.
+    """
+
+    def test_offset_shard_covering_no_rows_still_yields_a_schema(
+        self, spec: LanceDBConnectionSpec
+    ) -> None:
+        from lancedb_ray._plan import OffsetRange
+        from lancedb_ray._retry import RetryPolicy
+        from lancedb_ray.connection import open_table
+        from lancedb_ray.datasource import _read_offsets
+
+        schema = open_table(spec, "items").schema
+        blocks = list(
+            _read_offsets(
+                spec,
+                "items",
+                None,
+                OffsetRange(5, 5),  # empty range: no chunks at all
+                None,
+                1000,
+                RetryPolicy(max_attempts=1),
+                schema,
+            )
+        )
+
+        assert len(blocks) == 1
+        assert blocks[0].num_rows == 0
+        assert blocks[0].schema.names == schema.names
+
+    def test_single_strategy_with_no_matches_yields_a_schema(
+        self, spec: LanceDBConnectionSpec
+    ) -> None:
+        from lancedb_ray._retry import RetryPolicy
+        from lancedb_ray.connection import open_table
+        from lancedb_ray.datasource import _read_single
+
+        schema = open_table(spec, "items").schema
+        blocks = list(
+            _read_single(
+                spec,
+                "items",
+                None,
+                None,
+                "id < 0",  # matches nothing
+                1000,
+                RetryPolicy(max_attempts=1),
+                schema,
+            )
+        )
+
+        assert len(blocks) == 1
+        assert blocks[0].num_rows == 0
+        assert blocks[0].schema.names == schema.names
+
+
+class TestRayVersionCompatibility:
+    def test_block_metadata_built_for_older_ray(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Ray <2.48 took a ``schema`` argument that newer versions dropped.
+
+        The shim probes for it, so exercise the branch this Ray does not take.
+        """
+        import inspect as inspect_mod
+
+        from lancedb_ray import datasource as ds_mod
+
+        real_signature = inspect_mod.signature
+
+        class FakeParams(dict):  # type: ignore[type-arg]
+            def __contains__(self, key: object) -> bool:
+                return key == "schema" or super().__contains__(key)
+
+        def fake_signature(obj: Any) -> Any:
+            sig = real_signature(obj)
+            fake = type("Sig", (), {"parameters": FakeParams(dict(sig.parameters))})()
+            return fake
+
+        captured: dict[str, Any] = {}
+
+        def fake_block_metadata(**kwargs: Any) -> Any:
+            captured.update(kwargs)
+            return object()
+
+        # Patch by name: mypy treats a re-exported module attribute as private.
+        monkeypatch.setattr("lancedb_ray.datasource.inspect.signature", fake_signature)
+        monkeypatch.setattr(ds_mod, "BlockMetadata", fake_block_metadata)
+
+        schema = make_table(1).schema
+        ds_mod._build_block_metadata(7, schema)
+
+        assert captured["num_rows"] == 7
+        assert captured["schema"] is schema

@@ -63,7 +63,9 @@ testpaths = ["tests"]
 addopts = [
     "--cov=lancedb_ray",
     "--cov-report=term-missing",
-    "--cov-fail-under=90",
+    # Set just below where the suite actually sits, so a real
+    # regression trips it but ordinary churn does not.
+    "--cov-fail-under=95",
     # Ray forks workers and LanceDB's async runtime is only experimentally
     # fork-safe, so a task can deadlock. Fail the test with thread tracebacks
     # instead of stalling the run until the CI job is killed.
@@ -77,6 +79,9 @@ markers = [
 [tool.coverage.run]
 source = ["lancedb_ray"]
 omit = ["*/tests/*"]
+# Line coverage alone hides half-tested conditionals: a branch whose true arm
+# runs and whose false arm never does still counts every line as covered.
+branch = true
 
 [tool.mypy]
 # No python_version pin: it must match the interpreter actually running mypy,

@@ -189,7 +189,7 @@ that to be true.
 
 ```bash
 make build   # install with dev dependencies
-make test    # pytest with coverage (gate: 90%)
+make test    # pytest with branch coverage (gate: 95%)
 make lint    # ruff check + format check + mypy
 make fix     # auto-fix and format
 ```

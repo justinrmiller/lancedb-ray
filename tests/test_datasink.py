@@ -375,3 +375,50 @@ def test_retry_predicate_covers_transient_and_commit_conflicts() -> None:
     assert _retry_predicate(TimeoutError("connection timed out"))
     assert _retry_predicate(RuntimeError("commit conflict detected"))
     assert not _retry_predicate(ValueError("schema mismatch"))
+
+
+class RecordingTable:
+    """Captures the kwargs a write actually passes to LanceDB."""
+
+    def __init__(self) -> None:
+        self.add_calls: list[dict[str, Any]] = []
+        self.readers: list[Any] = []
+
+    def add(self, reader: Any, **kwargs: Any) -> None:
+        self.readers.append(reader)
+        self.add_calls.append(kwargs)
+
+
+class TestWriteParallelism:
+    """``write_parallelism`` controls how many parts the client uploads
+    concurrently inside one transaction, so it has to reach ``add``."""
+
+    def test_is_forwarded_when_set(self, seeded_spec: LanceDBConnectionSpec) -> None:
+        table = RecordingTable()
+        sink = LanceDBDatasink(seeded_spec, "items", write_parallelism=4)
+
+        write_arrow(sink, table, make_table(5), WriteStats())
+
+        assert table.add_calls == [{"write_parallelism": 4}]
+
+    def test_is_omitted_when_unset(self, seeded_spec: LanceDBConnectionSpec) -> None:
+        table = RecordingTable()
+        sink = LanceDBDatasink(seeded_spec, "items")
+
+        write_arrow(sink, table, make_table(5), WriteStats())
+
+        # Absent rather than None, so LanceDB applies its own default.
+        assert table.add_calls == [{}]
+
+    def test_rows_stream_rather_than_materialise(
+        self, seeded_spec: LanceDBConnectionSpec
+    ) -> None:
+        table = RecordingTable()
+        sink = LanceDBDatasink(seeded_spec, "items")
+
+        write_arrow(sink, table, make_table(7), WriteStats())
+
+        # A RecordBatchReader, not a materialised Table: that is what lets the
+        # client stream the rows as multiple parts under one upload.
+        assert isinstance(table.readers[0], pa.RecordBatchReader)
+        assert table.readers[0].read_all().num_rows == 7

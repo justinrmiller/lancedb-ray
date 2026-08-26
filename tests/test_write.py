@@ -492,3 +492,52 @@ class TestUpsertShuffleAvoidance:
             assert calls, "a parallel upsert must keep the duplicate guard"
         finally:
             io_mod._hash_partition = original  # type: ignore[assignment]
+
+
+class TestHashPartitionEdges:
+    """``_hash_partition`` guards upserts; its degenerate inputs still matter."""
+
+    def test_no_keys_passes_the_dataset_through_untouched(self) -> None:
+        from lancedb_ray.io import _hash_partition
+
+        ds = dataset_of(make_table(10))
+        assert _hash_partition(ds, None, 4) is ds
+        assert _hash_partition(ds, [], 4) is ds
+
+    @pytest.mark.parametrize("concurrency", [0, -1])
+    def test_non_positive_concurrency_falls_back_to_a_valid_block_count(
+        self, concurrency: int
+    ) -> None:
+        """Ray rejects a repartition into zero blocks, so it must be clamped."""
+        from lancedb_ray.io import _hash_partition
+
+        partitioned = _hash_partition(dataset_of(make_table(20)), ["id"], concurrency)
+        assert partitioned.materialize().count() == 20
+
+    def test_a_lazy_dataset_still_partitions(self) -> None:
+        """num_blocks() raises on a lazy dataset; the fallback must cope."""
+        from lancedb_ray.io import _hash_partition
+
+        lazy = dataset_of(make_table(30)).map_batches(lambda b: b)
+        partitioned = _hash_partition(lazy, ["id"], None)
+        assert partitioned.materialize().count() == 30
+
+
+class TestFragmentWriteVerification:
+    def test_a_dataset_the_database_cannot_open_is_reported(
+        self, db_dir: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A fragment write the catalog cannot resolve must not pass silently.
+
+        Rows on disk that LanceDB cannot open are worse than an outright
+        failure, because nothing signals that anything went wrong. Simulated
+        by letting the fragment write report success while writing nothing.
+        """
+        import lance_ray
+
+        monkeypatch.setattr(lance_ray, "write_lance", lambda *args, **kwargs: None)
+
+        with pytest.raises(RuntimeError, match="cannot open a table"):
+            write_lancedb(
+                dataset_of(make_table(20)), "items", uri=db_dir, mode="create"
+            )

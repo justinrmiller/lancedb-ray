@@ -371,3 +371,49 @@ class TestTableUriExistenceReuse:
         monkeypatch.setattr("lancedb_ray.connection.table_exists", fail)
         assert table_uri(spec, "items", exists=True).endswith("items.lance")
         assert table_uri(spec, "future", exists=False).endswith("future.lance")
+
+
+class TestTableListingFallbacks:
+    """``list_table_names`` has to cope with several backend shapes.
+
+    Newer LanceDB exposes a paginated ``list_tables``; older builds and some
+    connection types only have ``table_names``, and namespace-backed
+    connections raise ``NotImplementedError`` from ``list_tables``.
+    """
+
+    def test_falls_back_when_list_tables_is_absent(self) -> None:
+        class OldStyle:
+            def table_names(self) -> list[str]:
+                return ["alpha", "beta"]
+
+        assert list_table_names(OldStyle()) == ["alpha", "beta"]  # type: ignore[arg-type]
+
+    def test_falls_back_when_list_tables_is_unsupported(self) -> None:
+        class NamespaceStyle:
+            def list_tables(self, **kwargs: Any) -> Any:
+                raise NotImplementedError("Namespace operations are not supported")
+
+            def table_names(self) -> list[str]:
+                return ["gamma"]
+
+        assert list_table_names(NamespaceStyle()) == ["gamma"]  # type: ignore[arg-type]
+
+    def test_pages_through_a_multi_page_listing(self) -> None:
+        class Page:
+            def __init__(self, tables: list[str], token: str | None) -> None:
+                self.tables = tables
+                self.page_token = token
+
+        class Paginated:
+            def __init__(self) -> None:
+                self.tokens_seen: list[str | None] = []
+
+            def list_tables(self, page_token: str | None = None) -> Page:
+                self.tokens_seen.append(page_token)
+                if page_token is None:
+                    return Page(["one", "two"], "next")
+                return Page(["three"], None)
+
+        db = Paginated()
+        assert list_table_names(db) == ["one", "two", "three"]  # type: ignore[arg-type]
+        assert db.tokens_seen == [None, "next"]
