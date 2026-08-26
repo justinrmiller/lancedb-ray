@@ -343,6 +343,36 @@ def table_exists(spec_or_db: Union[LanceDBConnectionSpec, Any], name: str) -> bo
     return name in list_table_names(spec_or_db)
 
 
+def validate_table_name(name: str) -> None:
+    """Reject a table name that is not usable as one.
+
+    The local write path turns a name into a filesystem path by joining it to
+    the database URI, so a name containing a separator or a ``..`` segment
+    would place the dataset outside the database entirely -- silently, since
+    the write itself succeeds. LanceDB ships the authoritative rule, so defer
+    to it rather than inventing a second one, and fall back to a conservative
+    check if that entry point ever moves.
+    """
+    _validate: Optional[Any]
+    try:
+        # The native module carries no stubs; resolve it dynamically.
+        from lancedb import _lancedb
+
+        _validate = getattr(_lancedb, "validate_table_name", None)
+    except ImportError:  # pragma: no cover - depends on the installed build
+        _validate = None
+
+    if _validate is not None:
+        _validate(name)
+        return
+
+    if not name or "/" in name or "\\" in name:
+        raise ValueError(
+            f"Invalid table name {name!r}: names cannot be empty or contain "
+            "path separators."
+        )
+
+
 def table_uri(
     spec: LanceDBConnectionSpec, name: str, *, exists: Optional[bool] = None
 ) -> str:
@@ -360,6 +390,7 @@ def table_uri(
         raise TypeError(
             "LanceDB Cloud/Enterprise tables have no client-accessible dataset URI."
         )
+    validate_table_name(name)
     if exists if exists is not None else table_exists(spec, name):
         # ``uri`` exists on LanceTable; the base Table type does not declare it.
         return str(connect(spec).open_table(name).uri)  # type: ignore[attr-defined]

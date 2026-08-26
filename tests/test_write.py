@@ -541,3 +541,53 @@ class TestFragmentWriteVerification:
             write_lancedb(
                 dataset_of(make_table(20)), "items", uri=db_dir, mode="create"
             )
+
+
+class TestEmptyCreate:
+    """A create whose input turns out to be empty still owes you a table.
+
+    A dataset with no rows produces no fragments and therefore no manifest, so
+    the fragment path leaves nothing the database can open. A job whose filter
+    matched nothing still wants its table to exist.
+    """
+
+    def test_empty_dataset_creates_an_empty_table(self, db_dir: str) -> None:
+        import lancedb
+
+        schema = make_table(0).schema
+        write_lancedb(
+            dataset_of(make_table(0)), "items", uri=db_dir, mode="create", schema=schema
+        )
+
+        table = lancedb.connect(db_dir).open_table("items")
+        assert table.count_rows() == 0
+        assert set(table.schema.names) == set(schema.names)
+
+    def test_the_empty_table_accepts_a_later_append(self, db_dir: str) -> None:
+        import lancedb
+
+        write_lancedb(
+            dataset_of(make_table(0)),
+            "items",
+            uri=db_dir,
+            mode="create",
+            schema=make_table(0).schema,
+        )
+        write_lancedb(dataset_of(make_table(25)), "items", uri=db_dir, mode="append")
+
+        assert lancedb.connect(db_dir).open_table("items").count_rows() == 25
+
+    def test_without_a_schema_the_failure_is_explained(self, db_dir: str) -> None:
+        import lance_ray
+
+        # Simulate a write that produces nothing resolvable and no schema to
+        # rebuild from: the error should say what to pass.
+        original = lance_ray.write_lance
+        try:
+            lance_ray.write_lance = lambda *a, **k: None  # type: ignore[assignment]
+            with pytest.raises(RuntimeError, match="schema="):
+                write_lancedb(
+                    dataset_of(make_table(5)), "items", uri=db_dir, mode="create"
+                )
+        finally:
+            lance_ray.write_lance = original  # type: ignore[assignment]

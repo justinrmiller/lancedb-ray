@@ -126,7 +126,12 @@ def make_table(num_rows: int = 100, *, start: int = 0, label: str = "row") -> pa
             "vector": pa.FixedSizeListArray.from_arrays(
                 pa.array(vectors.reshape(-1), pa.float32()), VECTOR_DIM
             ),
-            "label": pa.array([f"{label}-{i}" for i in range(start, start + num_rows)]),
+            # Typed explicitly: with num_rows=0 the comprehension is empty and
+            # pyarrow would infer null, producing a schema that cannot later
+            # accept strings -- a trap only the empty-table tests would hit.
+            "label": pa.array(
+                [f"{label}-{i}" for i in range(start, start + num_rows)], pa.string()
+            ),
         }
     )
 

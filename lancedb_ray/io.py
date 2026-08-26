@@ -531,8 +531,20 @@ def _write_local_fragments(
     # table directly is one call; re-listing the whole catalog is not.
     try:
         connect(spec).open_table(table)
-    except Exception as error:  # noqa: BLE001 - re-raised with context
-        raise RuntimeError(
-            f"Wrote a Lance dataset to {dataset_uri!r} but database {spec.uri!r} "
-            f"cannot open a table named {table!r}."
-        ) from error
+        return
+    except Exception as error:  # noqa: BLE001 - one recoverable case below
+        resolve_error = error
+
+    # A dataset with no rows produces no fragments, and therefore no manifest
+    # for the database to open. Asking to create a table from an empty input is
+    # a reasonable thing to do -- a job whose filter matched nothing still wants
+    # its table -- so materialise it from the schema instead of failing.
+    if schema is not None:
+        connect(spec).create_table(table, schema=schema, mode="overwrite")
+        return
+
+    raise RuntimeError(
+        f"Wrote a Lance dataset to {dataset_uri!r} but database {spec.uri!r} "
+        f"cannot open a table named {table!r}. If the input was empty, pass "
+        "schema=... so the table can be created from it."
+    ) from resolve_error

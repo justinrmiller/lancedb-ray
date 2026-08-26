@@ -531,3 +531,35 @@ class TestCredentialRotation:
         # the secret never reaches a task definition or a log line.
         assert spec.api_key is None
         assert "secret-key" not in repr(spec)
+
+
+class TestTableNameValidation:
+    """A table name becomes a filesystem path on the local write path.
+
+    Joining an unchecked name to the database URI lets ``../escaped`` place the
+    dataset outside the database entirely, and the write itself succeeds, so
+    nothing signals it.
+    """
+
+    @pytest.mark.parametrize("name", ["../escaped", "a/b", "/absolute", ""])
+    def test_names_that_escape_or_nest_are_rejected(
+        self, db_dir: str, name: str
+    ) -> None:
+        spec = LanceDBConnectionSpec.create(db_dir)
+        with pytest.raises(Exception, match="(?i)invalid table name"):
+            table_uri(spec, name, exists=False)
+
+    def test_an_ordinary_name_still_works(self, db_dir: str) -> None:
+        spec = LanceDBConnectionSpec.create(db_dir)
+        assert table_uri(spec, "items", exists=False) == f"{db_dir}/items.lance"
+
+    def test_a_rejected_name_never_resolves_outside_the_database(
+        self, db_dir: str
+    ) -> None:
+        import pathlib
+
+        spec = LanceDBConnectionSpec.create(db_dir)
+        root = pathlib.Path(db_dir).resolve()
+        for name in ["ok", "also_ok", "with_underscores"]:
+            resolved = pathlib.Path(table_uri(spec, name, exists=False)).resolve()
+            assert str(resolved).startswith(str(root))
