@@ -27,6 +27,10 @@ from __future__ import annotations
 
 import argparse
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
 from typing import Any
 
 import lance
@@ -59,6 +63,106 @@ def storage_options(
         "allow_http": "true",
         "aws_virtual_hosted_style_request": "false",
     }
+
+
+def ensure_bucket(endpoint: str, bucket: str) -> str:
+    """Create the bucket unless it already exists.
+
+    Lance's object store will not create a bucket, and a write into a missing
+    one fails deep inside the S3 client with ``NoSuchBucket`` rather than
+    anything actionable. The emulator accepts unsigned requests, so a plain
+    HTTP PUT is enough and the AWS CLI is not needed.
+
+    Against real S3 this call will be rejected for want of a signature; create
+    the bucket yourself there, which you would be doing anyway.
+    """
+    url = f"{endpoint.rstrip('/')}/{bucket}"
+
+    try:
+        request = urllib.request.Request(url, method="HEAD")
+        with urllib.request.urlopen(request, timeout=10):
+            return "already exists"
+    except urllib.error.HTTPError as error:
+        if error.code != 404:
+            raise SystemExit(
+                f"Unexpected response checking bucket {bucket!r}: {error}"
+            ) from error
+    except urllib.error.URLError as error:
+        raise SystemExit(
+            f"Could not reach {endpoint}: {error.reason}\n"
+            "Is the emulator running?\n"
+            "  docker compose -f examples/object_storage/docker-compose.yml up -d"
+        ) from error
+
+    try:
+        request = urllib.request.Request(url, method="PUT")
+        with urllib.request.urlopen(request, timeout=10):
+            return "created"
+    except urllib.error.HTTPError as error:
+        raise SystemExit(
+            f"Could not create bucket {bucket!r}: {error}\n"
+            "Against real S3, create it yourself and re-run."
+        ) from error
+
+
+def clear_prefix(endpoint: str, bucket: str, prefix: str) -> int:
+    """Delete every object under ``prefix`` so the run starts from nothing.
+
+    Without this the result depends on what previous runs left behind: an
+    overwrite onto an existing table lands on top of its history, so the
+    version arithmetic differs between a first run and a repeat. Deleting
+    first makes every run identical and the assertions exact.
+    """
+    base = f"{endpoint.rstrip('/')}/{bucket}"
+    namespace = {"s3": "http://s3.amazonaws.com/doc/2006-03-01/"}
+    deleted = 0
+    token: str | None = None
+
+    while True:
+        query = {"list-type": "2", "prefix": f"{prefix.strip('/')}/"}
+        if token:
+            query["continuation-token"] = token
+        url = f"{base}?{urllib.parse.urlencode(query)}"
+
+        try:
+            with urllib.request.urlopen(url, timeout=30) as response:
+                body = response.read()
+        except urllib.error.HTTPError as error:
+            if error.code == 404:  # bucket not created yet: nothing to clear
+                return 0
+            raise
+
+        root = ET.fromstring(body)
+        keys = [
+            element.text
+            for element in root.findall(".//s3:Contents/s3:Key", namespace)
+            if element.text
+        ]
+        for key in keys:
+            quoted = urllib.parse.quote(key)
+            request = urllib.request.Request(f"{base}/{quoted}", method="DELETE")
+            try:
+                with urllib.request.urlopen(request, timeout=30):
+                    deleted += 1
+            except urllib.error.HTTPError as error:
+                if error.code not in (204, 404):
+                    raise
+
+        truncated = root.findtext(
+            "s3:IsTruncated", default="false", namespaces=namespace
+        )
+        token = root.findtext("s3:NextContinuationToken", namespaces=namespace)
+        if truncated.lower() != "true" or not token:
+            return deleted
+
+
+def count_versions(dataset_uri: str, options: dict[str, str]) -> int:
+    """Version count for a dataset, or 0 when it does not exist yet."""
+    try:
+        dataset: Any = lance.dataset(dataset_uri, storage_options=options)
+        return len(dataset.versions())
+    except Exception:  # noqa: BLE001 - absence is the expected first-run case
+        return 0
 
 
 def make_batch(num_rows: int, start: int, dim: int) -> pa.Table:
@@ -102,6 +206,12 @@ def main() -> None:
     parser.add_argument("--access-key", default=DEFAULT_KEY)
     parser.add_argument("--secret-key", default=DEFAULT_SECRET)
     parser.add_argument("--region", default=DEFAULT_REGION)
+    parser.add_argument(
+        "--no-clean",
+        dest="clean",
+        action="store_false",
+        help="Keep whatever a previous run left under --prefix",
+    )
     args = parser.parse_args()
 
     options = storage_options(
@@ -114,10 +224,23 @@ def main() -> None:
         f"Writing {args.rows:,} rows x {args.dim}d (~{approx_bytes / 1e6:.0f} MB) to {uri}"
     )
     print(f"  endpoint: {args.endpoint}")
+    # Before Ray starts: a missing bucket otherwise surfaces as NoSuchBucket
+    # from deep inside the S3 client, long after the dataset was generated.
+    print(f"  bucket:   {args.bucket} ({ensure_bucket(args.endpoint, args.bucket)})")
 
     ray.init(ignore_reinit_error=True, include_dashboard=False)
     try:
         ds = build_dataset(args.rows, args.dim, args.blocks)
+
+        if args.clean:
+            removed = clear_prefix(args.endpoint, args.bucket, args.prefix)
+            print(f"  cleaned:  {removed} existing object(s) under {args.prefix}/")
+
+        dataset_uri = f"{uri}/{args.table}.lance"
+        # Count first: an overwrite of an existing table legitimately lands on
+        # top of prior versions, so the invariant is that this write adds
+        # exactly one -- not that the table has exactly one in total.
+        versions_before = count_versions(dataset_uri, options)
 
         started = time.perf_counter()
         write_lancedb(
@@ -130,10 +253,9 @@ def main() -> None:
         )
         write_seconds = time.perf_counter() - started
 
-        dataset_uri = f"{uri}/{args.table}.lance"
         dataset: Any = lance.dataset(dataset_uri, storage_options=options)
         fragments = len(dataset.get_fragments())
-        versions = len(dataset.versions())
+        versions_added = len(dataset.versions()) - versions_before
 
         print(
             f"\nWrite finished in {write_seconds:.1f}s "
@@ -141,10 +263,12 @@ def main() -> None:
         )
         print(f"  rows      : {dataset.count_rows():,}")
         print(f"  fragments : {fragments}  (parallel write)")
-        print(f"  versions  : {versions}  (atomic commit)")
+        print(f"  versions  : +{versions_added}  (atomic commit)")
 
         assert dataset.count_rows() == args.rows, "row count mismatch"
-        assert versions == 1, "expected every fragment in a single commit"
+        assert versions_added == 1, (
+            f"expected the write to add exactly one version, added {versions_added}"
+        )
         assert fragments > 1, "expected the write to fan out across workers"
 
         started = time.perf_counter()

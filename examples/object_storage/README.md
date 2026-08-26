@@ -23,7 +23,8 @@ docker compose -f examples/object_storage/docker-compose.yml up -d
 python examples/object_storage/verify_s3.py --rows 2000000
 ```
 
-The script creates its bucket if needed, so the AWS CLI is not required.
+The script creates its bucket if needed and clears anything a previous run left
+under `--prefix`, so repeated runs are identical and the AWS CLI is not required.
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
@@ -33,6 +34,7 @@ The script creates its bucket if needed, so the AWS CLI is not required.
 | `--bucket` | `lancedb-ray` | Bucket name |
 | `--prefix` | `verify` | Key prefix holding the database |
 | `--endpoint` | `http://localhost:4566` | S3 endpoint |
+| `--no-clean` | *(off)* | Keep whatever a previous run left under `--prefix` |
 
 Tear down with:
 
@@ -49,10 +51,15 @@ It fails loudly rather than printing numbers nobody reads.
 **Every row survives the round trip.** Written count, read count, and the
 contents of a filtered slice all have to agree.
 
-**The write is atomic.** All fragments land in a *single* new table version.
-This matters more over a network than locally: workers upload independently and
-the driver commits once, so a reader either sees none of the data or all of it,
-never a partially-uploaded table.
+**The write is atomic.** The write adds exactly *one* new table version, no
+matter how many workers took part. This matters more over a network than
+locally: workers upload independently and the driver commits once, so a reader
+either sees none of the data or all of it, never a partially-uploaded table.
+
+The run clears its prefix first so this is exact. An overwrite onto an existing
+table legitimately stacks on that table's history, so without a clean start the
+version arithmetic differs between a first run and a repeat — and an assertion
+loose enough to accept both would no longer be testing atomicity.
 
 **The write fans out.** More than one fragment, so the work really was spread
 across workers instead of funnelling through the driver.
@@ -88,7 +95,10 @@ are all the same laptop. The numbers show the pipeline works and scales with
 blocks, not what S3 will do.
 
 **The bucket must exist before writing.** Lance's object store will not create
-one, so the script does it with a plain HTTP `PUT`.
+one, and writing into a missing bucket fails deep in the S3 client with
+`NoSuchBucket` rather than anything actionable — so the script checks with a
+`HEAD` and creates it with a plain `PUT`. Against real S3 that unsigned `PUT`
+will be rejected; create the bucket yourself there, as you would anyway.
 
 **Verified with podman as well as Docker.** The compose file is standard; any
 runtime that can run `floci/floci:latest` and publish `:4566` works.
