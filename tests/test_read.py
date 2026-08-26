@@ -181,3 +181,45 @@ class TestErrors:
         uri, _ = seeded_remote
         with pytest.raises(ValueError, match="strategy must be one of"):
             read_lancedb("items", uri=uri, api_key="k", remote_read_strategy="bogus")  # type: ignore[arg-type]
+
+
+class TestAfterDeletions:
+    """Offsets are positional over the *current* version.
+
+    Deleting rows shifts every later row's offset, so a shard plan built from a
+    stale row count would read past the end or skip rows. These pin down that
+    planning and reading agree on one post-deletion snapshot.
+    """
+
+    def test_offsets_read_is_correct_after_deletions(self, backend: Backend) -> None:
+        backend.create("items", make_table(200))
+        backend.open("items").delete("id % 2 = 0")
+
+        ds = read_lancedb("items", uri=backend.uri, **backend.kwargs)
+        assert ds.count() == 100
+        assert sorted_ids(ds) == list(range(1, 200, 2))
+
+    def test_sharded_read_is_correct_after_deletions(self, backend: Backend) -> None:
+        backend.create("items", make_table(500))
+        backend.open("items").delete("id < 200")
+
+        ds = read_lancedb(
+            "items", uri=backend.uri, override_num_blocks=6, **backend.kwargs
+        )
+        ids = [int(row["id"]) for row in ds.take_all()]
+        assert len(ids) == len(set(ids)) == 300
+        assert sorted(ids) == list(range(200, 500))
+
+    def test_filtered_read_is_correct_after_deletions(self, backend: Backend) -> None:
+        backend.create("items", make_table(300))
+        backend.open("items").delete("id >= 100")
+
+        ds = read_lancedb("items", uri=backend.uri, filter="id >= 50", **backend.kwargs)
+        assert sorted_ids(ds) == list(range(50, 100))
+
+    def test_reading_a_fully_emptied_table(self, backend: Backend) -> None:
+        backend.create("items", make_table(50))
+        backend.open("items").delete("id >= 0")
+
+        ds = read_lancedb("items", uri=backend.uri, **backend.kwargs)
+        assert ds.count() == 0
