@@ -21,6 +21,7 @@ from ray.data import Dataset
 from ._retry import RetryPolicy
 from .connection import (
     LanceDBConnectionSpec,
+    connect,
     open_table,
     table_exists,
     table_uri,
@@ -328,7 +329,7 @@ def write_lancedb(
     # and fail much later with a confusing storage-level error.
     normalized_on = validate_write_args(mode, on)
 
-    if mode == "upsert" and partition_on_keys:
+    if mode == "upsert" and partition_on_keys and _can_race(concurrency):
         # Two tasks each holding one row for the same key will each find the
         # key absent and each insert it -- silently duplicating it, since
         # neither source is internally ambiguous. Hash-partitioning on the key
@@ -383,6 +384,15 @@ def write_lancedb(
     ds.write_datasink(
         datasink, ray_remote_args=ray_remote_args, concurrency=concurrency
     )
+
+
+def _can_race(concurrency: Optional[int]) -> bool:
+    """Whether more than one write task can run at once.
+
+    A single-task write cannot race with itself, so the shuffle that guards
+    against concurrent merge-inserts is pure cost there.
+    """
+    return concurrency is None or concurrency > 1
 
 
 def _hash_partition(
@@ -467,8 +477,10 @@ def _write_local_fragments(
     """
     import lance_ray
 
-    dataset_uri = table_uri(spec, table)
+    # One catalog listing, reused: listing is paginated and costs a round trip
+    # per page against Cloud/Enterprise.
     exists = table_exists(spec, table)
+    dataset_uri = table_uri(spec, table, exists=exists)
 
     if mode == "create" and exists:
         raise ValueError(
@@ -497,9 +509,12 @@ def _write_local_fragments(
         concurrency=concurrency,
     )
 
-    # Make sure the database can now resolve the table we just materialised.
-    if not table_exists(spec, table):
+    # Confirm the database can now resolve what we materialised. Opening the
+    # table directly is one call; re-listing the whole catalog is not.
+    try:
+        connect(spec).open_table(table)
+    except Exception as error:  # noqa: BLE001 - re-raised with context
         raise RuntimeError(
             f"Wrote a Lance dataset to {dataset_uri!r} but database {spec.uri!r} "
-            f"does not list a table named {table!r}."
-        )
+            f"cannot open a table named {table!r}."
+        ) from error

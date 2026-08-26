@@ -434,3 +434,61 @@ class TestUpsertHashPartitioning:
             **backend.kwargs,
         )
         assert backend.count("items") == 100
+
+
+class TestUpsertShuffleAvoidance:
+    def test_a_single_task_upsert_skips_the_shuffle(self, db_dir: str) -> None:
+        """One write task cannot race with itself, so the guard is pure cost."""
+        import lancedb_ray.io as io_mod
+
+        calls: list[object] = []
+        original = io_mod._hash_partition
+
+        def spy(*args: Any, **kwargs: Any) -> Any:
+            calls.append(args)
+            return original(*args, **kwargs)
+
+        io_mod._hash_partition = spy  # type: ignore[assignment]
+        try:
+            backend_uri = db_dir
+            write_lancedb(
+                dataset_of(make_table(50)), "items", uri=backend_uri, mode="create"
+            )
+            write_lancedb(
+                dataset_of(make_table(20)),
+                "items",
+                uri=backend_uri,
+                mode="upsert",
+                on="id",
+                concurrency=1,
+            )
+            assert not calls, "single-task upsert should not shuffle"
+        finally:
+            io_mod._hash_partition = original  # type: ignore[assignment]
+
+    def test_a_parallel_upsert_still_shuffles(self, db_dir: str) -> None:
+        import lancedb_ray.io as io_mod
+
+        calls: list[object] = []
+        original = io_mod._hash_partition
+
+        def spy(*args: Any, **kwargs: Any) -> Any:
+            calls.append(args)
+            return original(*args, **kwargs)
+
+        io_mod._hash_partition = spy  # type: ignore[assignment]
+        try:
+            write_lancedb(
+                dataset_of(make_table(50)), "items", uri=db_dir, mode="create"
+            )
+            write_lancedb(
+                dataset_of(make_table(20)),
+                "items",
+                uri=db_dir,
+                mode="upsert",
+                on="id",
+                concurrency=4,
+            )
+            assert calls, "a parallel upsert must keep the duplicate guard"
+        finally:
+            io_mod._hash_partition = original  # type: ignore[assignment]

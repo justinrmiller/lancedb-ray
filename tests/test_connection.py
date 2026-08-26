@@ -299,3 +299,75 @@ def test_to_lance_on_an_object_without_the_method_is_refused() -> None:
 
     with pytest.raises(TypeError, match="does not expose an underlying Lance"):
         to_lance(NoDataset())  # type: ignore[arg-type]
+
+
+class TestPinnedHandleCaching:
+    """Opening a table is a round trip; a read job does one per task.
+
+    A pinned handle can be cached safely because its version is fixed, so it
+    can never drift. An unpinned handle must not be cached: ``checkout``
+    mutates in place, and a writer holding a stale "latest" would target the
+    wrong version.
+    """
+
+    def test_pinned_handles_are_reused(
+        self, seeded_local: tuple[str, pa.Table]
+    ) -> None:
+        db_dir, _ = seeded_local
+        spec = LanceDBConnectionSpec.create(db_dir)
+        assert open_table(spec, "items", version=1) is open_table(
+            spec, "items", version=1
+        )
+
+    def test_different_versions_get_different_handles(
+        self, seeded_local: tuple[str, pa.Table]
+    ) -> None:
+        db_dir, table = seeded_local
+        spec = LanceDBConnectionSpec.create(db_dir)
+        connect(spec).open_table("items").add(table)
+
+        first = open_table(spec, "items", version=1)
+        second = open_table(spec, "items", version=2)
+        assert first is not second
+        assert first.count_rows() == 100
+        assert second.count_rows() == 200
+
+    def test_unpinned_handles_are_not_cached(
+        self, seeded_local: tuple[str, pa.Table]
+    ) -> None:
+        db_dir, _ = seeded_local
+        spec = LanceDBConnectionSpec.create(db_dir)
+        assert open_table(spec, "items") is not open_table(spec, "items")
+
+    def test_an_unpinned_handle_sees_writes_made_after_it(
+        self, seeded_local: tuple[str, pa.Table]
+    ) -> None:
+        db_dir, table = seeded_local
+        spec = LanceDBConnectionSpec.create(db_dir)
+        connect(spec).open_table("items").add(table)
+        # Caching this would have pinned the writer to a stale version.
+        assert open_table(spec, "items").count_rows() == 200
+
+    def test_clearing_the_cache_drops_pinned_handles(
+        self, seeded_local: tuple[str, pa.Table]
+    ) -> None:
+        db_dir, _ = seeded_local
+        spec = LanceDBConnectionSpec.create(db_dir)
+        first = open_table(spec, "items", version=1)
+        clear_connection_cache()
+        assert open_table(spec, "items", version=1) is not first
+
+
+class TestTableUriExistenceReuse:
+    def test_passing_a_known_existence_skips_the_listing(
+        self, seeded_local: tuple[str, pa.Table], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        db_dir, _ = seeded_local
+        spec = LanceDBConnectionSpec.create(db_dir)
+
+        def fail(*args: Any, **kwargs: Any) -> None:
+            raise AssertionError("catalog listing should have been skipped")
+
+        monkeypatch.setattr("lancedb_ray.connection.table_exists", fail)
+        assert table_uri(spec, "items", exists=True).endswith("items.lance")
+        assert table_uri(spec, "future", exists=False).endswith("future.lance")

@@ -13,7 +13,7 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from functools import cache
+from functools import cache, lru_cache
 from typing import TYPE_CHECKING, Any, Optional, Union, cast
 
 if TYPE_CHECKING:
@@ -180,8 +180,18 @@ def connect(spec: LanceDBConnectionSpec) -> lancedb.DBConnection:
 
 
 def clear_connection_cache() -> None:
-    """Drop all cached connections. Primarily a test hook."""
+    """Drop all cached connections and table handles. Primarily a test hook."""
     _connect_cached.cache_clear()
+    _open_pinned_table.cache_clear()
+
+
+@lru_cache(maxsize=32)
+def _open_pinned_table(
+    spec: LanceDBConnectionSpec, name: str, version: Union[int, str]
+) -> lancedb.table.Table:
+    table = connect(spec).open_table(name)
+    table.checkout(version)
+    return table
 
 
 def open_table(
@@ -190,20 +200,22 @@ def open_table(
     *,
     version: Optional[Union[int, str]] = None,
 ) -> lancedb.table.Table:
-    """Open ``name`` and optionally pin it to ``version``.
+    """Open ``name``, optionally pinned to ``version``.
 
     Pinning matters for distributed reads: without it, shards issued at
     different wall-clock times could observe different table versions and the
     resulting Ray Dataset would be torn.
 
-    Note that the returned handle is *not* cached, because ``checkout`` mutates
-    the table object in place and different read tasks may want different
-    versions of the same table.
+    A pinned handle is cached per worker process, keyed on the version, because
+    opening a table is a round trip against Cloud/Enterprise and a read job
+    issues one per task. Caching is safe only because the version is fixed --
+    the handle can never drift. An unpinned open is deliberately *not* cached:
+    ``checkout`` mutates the handle in place, and a writer holding a stale
+    "latest" would be operating on the wrong version.
     """
-    table = connect(spec).open_table(name)
     if version is not None:
-        table.checkout(version)
-    return table
+        return _open_pinned_table(spec, name, version)
+    return connect(spec).open_table(name)
 
 
 def table_dataset_uri(table: lancedb.table.Table) -> str:
@@ -280,17 +292,24 @@ def table_exists(spec_or_db: Union[LanceDBConnectionSpec, Any], name: str) -> bo
     return name in list_table_names(spec_or_db)
 
 
-def table_uri(spec: LanceDBConnectionSpec, name: str) -> str:
+def table_uri(
+    spec: LanceDBConnectionSpec, name: str, *, exists: Optional[bool] = None
+) -> str:
     """Return the Lance dataset URI backing local table ``name``.
 
     Works whether or not the table exists yet, so the distributed write path can
     create a dataset at the location LanceDB will later resolve.
+
+    Args:
+        exists: Pass a known existence result to skip the catalog listing.
+            Listing is paginated and costs a round trip per page against
+            Cloud/Enterprise, so callers that already checked should say so.
     """
     if spec.is_remote:
         raise TypeError(
             "LanceDB Cloud/Enterprise tables have no client-accessible dataset URI."
         )
-    if table_exists(spec, name):
+    if exists if exists is not None else table_exists(spec, name):
         # ``uri`` exists on LanceTable; the base Table type does not declare it.
         return str(connect(spec).open_table(name).uri)  # type: ignore[attr-defined]
     return f"{spec.uri.rstrip('/')}/{name}.lance"
