@@ -7,7 +7,7 @@ from typing import Any
 import pyarrow as pa
 import pytest
 from lancedb_ray.connection import LanceDBConnectionSpec
-from lancedb_ray.datasource import LanceDBDatasource
+from lancedb_ray.datasource import LanceDBDatasource, _apply_columns
 
 from conftest import make_table
 
@@ -52,6 +52,27 @@ class TestStrategySelection:
             LanceDBDatasource(spec, "items", batch_size=0)
 
 
+class TestColumnProjection:
+    def test_empty_column_list_is_rejected(self, spec: LanceDBConnectionSpec) -> None:
+        # An empty list used to be normalised to None, which silently read
+        # every column -- the opposite of the projection that was asked for.
+        with pytest.raises(ValueError, match="columns=\\[\\] selects no columns"):
+            LanceDBDatasource(spec, "items", columns=[])
+
+    def test_named_columns_are_kept(self, spec: LanceDBConnectionSpec) -> None:
+        source = LanceDBDatasource(spec, "items", columns=["id"])
+        assert source._columns == ["id"]
+
+    def test_no_projection_stays_none(self, spec: LanceDBConnectionSpec) -> None:
+        assert LanceDBDatasource(spec, "items")._columns is None
+
+    def test_apply_columns_guards_against_a_bypassed_constructor(self) -> None:
+        # Defence in depth: the helper runs inside workers, where a directly
+        # constructed datasource could still deliver an empty list.
+        with pytest.raises(ValueError, match="columns=\\[\\] selects no columns"):
+            _apply_columns(object(), [])
+
+
 class TestVersionPinning:
     def test_pins_the_current_version_by_default(
         self, spec: LanceDBConnectionSpec
@@ -77,6 +98,42 @@ class TestVersionPinning:
 
     def test_explicit_version_is_used(self, spec: LanceDBConnectionSpec) -> None:
         assert LanceDBDatasource(spec, "items", version=1).version == 1
+
+    @pytest.mark.parametrize("version", [None, 1])
+    def test_the_scan_is_sized_after_the_version_is_pinned(
+        self,
+        spec: LanceDBConnectionSpec,
+        monkeypatch: pytest.MonkeyPatch,
+        version: Any,
+    ) -> None:
+        """Sizing an unpinned handle lets a concurrent commit skew the plan.
+
+        The row count decides the shard boundaries and the read tasks pin the
+        captured version, so a count taken against "latest" can plan a row
+        space the workers never see. ``take_offsets`` truncates silently past
+        the end, so the mismatch never surfaces as an error.
+        """
+        import _fakes
+
+        calls: list[str] = []
+        real_checkout = _fakes.FakeRemoteTable.checkout
+        real_count = _fakes.FakeRemoteTable.count_rows
+
+        def spy_checkout(self: Any, v: Any) -> Any:
+            calls.append("checkout")
+            return real_checkout(self, v)
+
+        def spy_count(self: Any, filter: Any = None) -> Any:
+            calls.append("count_rows")
+            return real_count(self, filter)
+
+        monkeypatch.setattr(_fakes.FakeRemoteTable, "checkout", spy_checkout)
+        monkeypatch.setattr(_fakes.FakeRemoteTable, "count_rows", spy_count)
+
+        LanceDBDatasource(spec, "items", version=version)
+
+        assert "checkout" in calls, "the driver never pinned the handle"
+        assert calls.index("checkout") < calls.index("count_rows")
 
 
 class TestReadTaskPlanning:
@@ -271,6 +328,42 @@ class TestSingleStrategyExecution:
         source = LanceDBDatasource(spec, "items", strategy="single")
         (task,) = source.get_read_tasks(1, per_task_row_limit=10)
         assert (task.metadata.num_rows or 0) == 10
+        # Asserting the metadata alone let the task stream the whole table
+        # while claiming it had produced ten rows.
+        assert sum(block.num_rows for block in task()) == 10
+
+    def test_single_task_limit_is_pushed_into_the_query(
+        self, spec: LanceDBConnectionSpec
+    ) -> None:
+        """The limit must shrink the read, not just trim what comes back."""
+        source = LanceDBDatasource(spec, "items", strategy="single", batch_size=5)
+        (task,) = source.get_read_tasks(1, per_task_row_limit=7)
+        rows = sum(block.num_rows for block in task())
+        assert rows == 7
+
+    def test_single_task_without_a_limit_still_streams_everything(
+        self, spec: LanceDBConnectionSpec
+    ) -> None:
+        source = LanceDBDatasource(spec, "items", strategy="single")
+        (task,) = source.get_read_tasks(1)
+        assert sum(block.num_rows for block in task()) == 100
+
+    @pytest.mark.parametrize("strategy", ["offsets", "pagination", "single"])
+    def test_read_tasks_carry_the_limit_for_ray_to_enforce(
+        self, spec: LanceDBConnectionSpec, strategy: str
+    ) -> None:
+        source = LanceDBDatasource(spec, "items", strategy=strategy)  # type: ignore[arg-type]
+        tasks = source.get_read_tasks(3, per_task_row_limit=4)
+        assert tasks
+        assert all(t.per_task_row_limit == 4 for t in tasks)
+        assert all(sum(b.num_rows for b in t()) <= 4 for t in tasks)
+
+    @pytest.mark.parametrize("strategy", ["offsets", "pagination", "single"])
+    def test_no_limit_leaves_the_read_task_unbounded(
+        self, spec: LanceDBConnectionSpec, strategy: str
+    ) -> None:
+        source = LanceDBDatasource(spec, "items", strategy=strategy)  # type: ignore[arg-type]
+        assert all(t.per_task_row_limit is None for t in source.get_read_tasks(3))
 
 
 class TestPaginationEdgeCases:

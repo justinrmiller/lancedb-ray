@@ -454,6 +454,64 @@ class TestUpsertHashPartitioning:
         assert backend.count("items") == 100
 
 
+class TestHashShuffleRequirement:
+    def test_a_sort_shuffle_strategy_is_refused_with_a_usable_message(
+        self, db_dir: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Key-based repartitioning only exists under a hash shuffle.
+
+        Ray otherwise raises at plan time naming an internal config, and the
+        co-location the shuffle exists to guarantee would be gone regardless.
+        """
+        from ray.data.context import DataContext, ShuffleStrategy
+
+        Backend("local", db_dir, {}).create("items", make_table(5))
+        monkeypatch.setattr(
+            DataContext.get_current(),
+            "shuffle_strategy",
+            ShuffleStrategy.SORT_SHUFFLE_PULL_BASED,
+        )
+        with pytest.raises(ValueError, match="needs a hash-based shuffle"):
+            write_lancedb(
+                dataset_of(make_table(5)), "items", uri=db_dir, mode="upsert", on="id"
+            )
+
+    def test_the_escape_hatch_still_works_under_a_sort_shuffle(
+        self, db_dir: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import lancedb
+        from ray.data.context import DataContext, ShuffleStrategy
+
+        Backend("local", db_dir, {}).create("items", make_table(5))
+        monkeypatch.setattr(
+            DataContext.get_current(),
+            "shuffle_strategy",
+            ShuffleStrategy.SORT_SHUFFLE_PULL_BASED,
+        )
+        write_lancedb(
+            dataset_of(make_table(5, start=3)),
+            "items",
+            uri=db_dir,
+            mode="upsert",
+            on="id",
+            partition_on_keys=False,
+        )
+        assert lancedb.connect(db_dir).open_table("items").count_rows() == 8
+
+    def test_the_default_strategy_is_accepted(self, db_dir: str) -> None:
+        import lancedb
+
+        Backend("local", db_dir, {}).create("items", make_table(5))
+        write_lancedb(
+            dataset_of(make_table(5, start=3)),
+            "items",
+            uri=db_dir,
+            mode="upsert",
+            on="id",
+        )
+        assert lancedb.connect(db_dir).open_table("items").count_rows() == 8
+
+
 class TestUpsertShuffleAvoidance:
     def test_a_single_task_upsert_skips_the_shuffle(self, db_dir: str) -> None:
         """One write task cannot race with itself, so the guard is pure cost."""
@@ -791,20 +849,128 @@ class TestEmptyCreate:
 
         assert lancedb.connect(db_dir).open_table("items").count_rows() == 25
 
-    def test_without_a_schema_the_failure_is_explained(self, db_dir: str) -> None:
+    def test_empty_create_without_a_schema_uses_the_dataset_schema(
+        self, db_dir: str
+    ) -> None:
+        """The default local path must not need a schema Ray already knows.
+
+        The table API path creates the table from the input's schema, so the
+        fragment path failing here made the same call succeed or fail purely on
+        which strategy it happened to take.
+        """
+        import lancedb
+
+        source = make_table(0)
+        write_lancedb(dataset_of(source), "items", uri=db_dir, mode="create")
+
+        table = lancedb.connect(db_dir).open_table("items")
+        assert table.count_rows() == 0
+        assert set(table.schema.names) == set(source.schema.names)
+
+    def test_both_write_paths_agree_on_an_empty_create(self, db_dir: str) -> None:
+        import lancedb
+
+        for strategy, name in (("fragment", "frag"), ("api", "api")):
+            write_lancedb(
+                dataset_of(make_table(0)),
+                name,
+                uri=db_dir,
+                mode="create",
+                local_write_strategy=strategy,  # type: ignore[arg-type]
+            )
+        db = lancedb.connect(db_dir)
+        assert db.open_table("frag").count_rows() == 0
+        assert set(db.open_table("frag").schema.names) == set(
+            db.open_table("api").schema.names
+        )
+
+    def test_without_any_schema_the_failure_is_explained(
+        self, db_dir: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import lance_ray
+        from lancedb_ray import io as io_module
+
+        # An empty input that produces nothing resolvable *and* a dataset Ray
+        # cannot report a schema for: the error should say what to pass.
+        monkeypatch.setattr(lance_ray, "write_lance", lambda *a, **k: None)
+        monkeypatch.setattr(io_module, "_arrow_schema", lambda ds: None)
+        with pytest.raises(RuntimeError, match="schema="):
+            write_lancedb(dataset_of(make_table(0)), "items", uri=db_dir, mode="create")
+
+    @pytest.mark.parametrize("schema_arg", [None, "explicit"])
+    def test_rows_that_vanished_are_never_papered_over(
+        self, db_dir: str, monkeypatch: pytest.MonkeyPatch, schema_arg: Any
+    ) -> None:
+        """An absent dataset is only benign when the input had no rows.
+
+        Standing an empty table where a completed write should be reports
+        success over the loss. Passing ``schema=`` used to be enough to reach
+        that path with a non-empty input.
+        """
         import lance_ray
 
-        # Simulate a write that produces nothing resolvable and no schema to
-        # rebuild from: the error should say what to pass.
-        original = lance_ray.write_lance
-        try:
-            lance_ray.write_lance = lambda *a, **k: None  # type: ignore[assignment]
-            with pytest.raises(RuntimeError, match="schema="):
-                write_lancedb(
-                    dataset_of(make_table(5)), "items", uri=db_dir, mode="create"
-                )
-        finally:
-            lance_ray.write_lance = original  # type: ignore[assignment]
+        monkeypatch.setattr(lance_ray, "write_lance", lambda *a, **k: None)
+        schema = make_table(0).schema if schema_arg else None
+        with pytest.raises(RuntimeError, match="Refusing to replace it"):
+            write_lancedb(
+                dataset_of(make_table(20)),
+                "items",
+                uri=db_dir,
+                mode="create",
+                schema=schema,
+            )
+
+
+class TestRecoveryProbes:
+    """The recovery path's probes must answer "cannot tell", never guess.
+
+    Both feed the decision to stand an empty table at a URI, so a probe that
+    reported a confident wrong answer would do it over a completed write.
+    """
+
+    def test_an_unreadable_schema_reports_cannot_tell(self) -> None:
+        from lancedb_ray.io import _arrow_schema
+
+        class Broken:
+            def schema(self, fetch_if_missing: bool = False) -> Any:
+                raise RuntimeError("plan could not be executed")
+
+        assert _arrow_schema(Broken()) is None  # type: ignore[arg-type]
+
+    def test_a_non_arrow_schema_reports_cannot_tell(self) -> None:
+        from lancedb_ray.io import _arrow_schema
+
+        class Simple:
+            def schema(self, fetch_if_missing: bool = False) -> Any:
+                return "not a schema"
+
+        assert _arrow_schema(Simple()) is None  # type: ignore[arg-type]
+
+    def test_an_uncountable_input_reports_cannot_tell(self) -> None:
+        from lancedb_ray.io import _input_row_count
+
+        class Broken:
+            def count(self) -> int:
+                raise RuntimeError("plan could not be executed")
+
+        assert _input_row_count(Broken()) is None  # type: ignore[arg-type]
+
+    def test_an_uncountable_input_is_never_papered_over(
+        self, db_dir: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import lance_ray
+        from lancedb_ray import io as io_module
+
+        monkeypatch.setattr(lance_ray, "write_lance", lambda *a, **k: None)
+        monkeypatch.setattr(io_module, "_input_row_count", lambda ds: None)
+        with pytest.raises(RuntimeError, match="input was not empty"):
+            write_lancedb(
+                dataset_of(make_table(0)),
+                "items",
+                uri=db_dir,
+                mode="create",
+                schema=make_table(0).schema,
+            )
 
 
 class TestFailedWriteAtomicity:

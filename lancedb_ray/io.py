@@ -35,7 +35,12 @@ from .datasink import (
     WriteMode,
     validate_write_args,
 )
-from .datasource import LanceDBDatasource, RemoteReadStrategy
+from .datasource import (
+    DEFAULT_BATCH_SIZE,
+    LanceDBDatasource,
+    RemoteReadStrategy,
+    validate_columns,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -109,7 +114,7 @@ def read_lancedb(
     filter: Optional[str] = None,
     version: Optional[Union[int, str]] = None,
     remote_read_strategy: RemoteReadStrategy = "auto",
-    batch_size: int = 50_000,
+    batch_size: Optional[int] = None,
     scanner_options: Optional[Mapping[str, Any]] = None,
     ray_remote_args: Optional[dict[str, Any]] = None,
     concurrency: Optional[int] = None,
@@ -155,7 +160,10 @@ def read_lancedb(
         version: Table version to pin. Defaults to the current version.
         remote_read_strategy: Remote sharding strategy -- ``auto`` (default),
             ``offsets``, ``pagination`` or ``single``. Ignored for local tables.
-        batch_size: Rows per request issued by each remote read task.
+        batch_size: Rows fetched per read request. On a remote read this sizes
+            each task's requests; on a local read it sizes the Lance scanner's
+            batches, and takes precedence over a ``batch_size`` named in
+            ``scanner_options``. Defaults to the backend's own sizing.
         scanner_options: Extra options for the Lance scanner on **local** reads
             -- ``batch_size``, ``use_scalar_index``, ``late_materialization``,
             ``with_row_id`` and friends. Without this the local scan is only
@@ -171,6 +179,12 @@ def read_lancedb(
         A Ray Dataset over the table's contents.
     """
     _validate_concurrency(concurrency)
+    if batch_size is not None and batch_size <= 0:
+        raise ValueError(f"batch_size must be positive, got {batch_size}")
+    # Checked before the local/remote split: the two paths hand ``columns`` to
+    # different engines, which disagree about what an empty list means (one
+    # reads every column, the other reads none). Neither is what was asked for.
+    validate_columns(columns)
     spec = _build_spec(
         uri,
         api_key,
@@ -189,6 +203,7 @@ def read_lancedb(
             columns=columns,
             filter=filter,
             version=version,
+            batch_size=batch_size,
             scanner_options=scanner_options,
             ray_remote_args=ray_remote_args,
             concurrency=concurrency,
@@ -210,7 +225,7 @@ def read_lancedb(
         filter=filter,
         version=version,
         strategy=remote_read_strategy,
-        batch_size=batch_size,
+        batch_size=batch_size if batch_size is not None else DEFAULT_BATCH_SIZE,
     )
     return cast(
         "Dataset",
@@ -230,6 +245,7 @@ def _read_local(
     columns: Optional[list[str]],
     filter: Optional[str],
     version: Optional[Union[int, str]],
+    batch_size: Optional[int],
     scanner_options: Optional[Mapping[str, Any]],
     ray_remote_args: Optional[dict[str, Any]],
     concurrency: Optional[int],
@@ -248,13 +264,21 @@ def _read_local(
     # independently and could disagree.
     pinned = version if version is not None else dataset.version
 
+    # ``batch_size`` is a scanner option locally. Folding it in here is what
+    # makes the argument mean the same thing on both backends -- it used to be
+    # accepted and then silently dropped, which is the "tuning that did
+    # nothing" that ``scanner_options`` is rejected for remotely.
+    scan_opts = dict(scanner_options) if scanner_options else {}
+    if batch_size is not None:
+        scan_opts["batch_size"] = batch_size
+
     return lance_ray.read_lance(
         uri=dataset.uri,
         columns=columns,
         filter=filter,
         storage_options=dict(spec.storage_options) if spec.storage_options else None,
         dataset_options={"version": pinned},
-        scanner_options=dict(scanner_options) if scanner_options else None,
+        scanner_options=scan_opts or None,
         ray_remote_args=ray_remote_args,
         concurrency=concurrency,
         override_num_blocks=override_num_blocks,
@@ -348,10 +372,17 @@ def write_lancedb(
             know the keys are unique and want to skip the shuffle.
         schema: Schema used when creating the table. Defaults to the dataset's.
         transform_fn: Optional per-batch transform applied before writing.
-            Only supported on the API write path; requesting it for a local
-            append switches that write to the API path.
-        min_rows_per_write: Rows accumulated per request on the API path.
-        max_rows_per_request: Ceiling on rows in a single request.
+            On the API path the sink applies it per batch; on the fragment path
+            it runs as its own Ray stage beforehand, so the write itself still
+            commits once. Note it runs *after* ``partition_on_keys`` has
+            shuffled, so a transform that rewrites a key column undoes that
+            co-location.
+        rows_per_transaction: Rows Ray bundles into each write task, which is
+            what sets the transaction size and the task's peak memory.
+        max_rows_per_request: Ceiling on rows in a single request; larger
+            accumulations are split across several. Setting either per-request
+            ceiling means a task no longer writes in one transaction, so a
+            failure partway can leave earlier chunks committed.
         max_bytes_per_request: Ceiling on the size of a single request's
             payload, on the API path. Rows are a poor proxy for size once a
             schema is wide -- 256K rows of a 1536-dimension float32 embedding is
@@ -384,7 +415,8 @@ def write_lancedb(
             fixed when the dataset is created -- a table written without it
             cannot be switched later without a rewrite -- so it is worth
             deciding at creation rather than discovering afterwards.
-        retry_policy: Retry behaviour for failed batches on the API path.
+        write_parallelism: How many parts the client uploads concurrently
+            within one transaction, on the API path.
         ray_remote_args: Resource arguments for the write tasks.
         concurrency: Maximum number of concurrent write tasks. Local upserts
             default to 4 because concurrent merge-insert contends on the
@@ -511,6 +543,36 @@ def _can_race(concurrency: Optional[int]) -> bool:
     return concurrency is None or concurrency > 1
 
 
+#: Ray shuffle strategies that implement key-based repartitioning.
+_HASH_SHUFFLE_STRATEGIES = ("hash_shuffle", "hash_shuffle_v2", "gpu_shuffle")
+
+
+def _require_hash_shuffle() -> None:
+    """Fail early when Ray cannot hash-partition on a key.
+
+    ``repartition(keys=...)`` is implemented only for the hash-based shuffle
+    strategies. Under a sort-based one Ray raises at plan time, naming an
+    internal config rather than the upsert that needed it -- and the guarantee
+    the shuffle exists to provide would be gone either way. The default is
+    hash-based, so this only fires where a cluster has changed it.
+    """
+    try:
+        from ray.data.context import DataContext
+
+        strategy = DataContext.get_current().shuffle_strategy
+    except Exception:  # pragma: no cover - depends on the installed Ray
+        return
+    if str(getattr(strategy, "value", strategy)) in _HASH_SHUFFLE_STRATEGIES:
+        return
+    raise ValueError(
+        "mode='upsert' with partition_on_keys=True needs a hash-based shuffle "
+        f"to co-locate each key, but DataContext.shuffle_strategy is {strategy!r}. "
+        "Set it to ShuffleStrategy.HASH_SHUFFLE, or pass partition_on_keys=False "
+        "if the source's keys are already unique -- with repeated keys and more "
+        "than one write task, rows for the same key duplicate silently."
+    )
+
+
 def _hash_partition(
     ds: Dataset, keys: Optional[list[str]], concurrency: Optional[int]
 ) -> Dataset:
@@ -523,6 +585,8 @@ def _hash_partition(
     """
     if not keys:
         return ds
+
+    _require_hash_shuffle()
 
     num_blocks = concurrency if concurrency and concurrency > 0 else None
     if num_blocks is None:
@@ -660,18 +724,35 @@ def _write_local_fragments(
             "is left untouched rather than replaced with an empty table."
         ) from resolve_error
 
+    # An absent dataset is only benign when the input genuinely had no rows.
+    # If it had rows, they went somewhere this write cannot account for, and
+    # putting an empty table at that URI would report success over the loss.
+    # Establish the count before assuming; "cannot tell" is not "empty".
+    num_input_rows = _input_row_count(ds)
+    if num_input_rows != 0:
+        raise RuntimeError(
+            f"The write produced no Lance dataset at {dataset_uri!r} and database "
+            f"{spec.uri!r} cannot open a table named {table!r}, but the input was "
+            + ("not empty" if num_input_rows is None else f"{num_input_rows} rows")
+            + ". Refusing to replace it with an empty table."
+        ) from resolve_error
+
     # A job whose filter matched nothing still wants its table, so materialise
-    # it from the schema rather than failing.
-    if schema is None:
+    # it from the schema rather than failing. Ray knows the input's schema even
+    # when the input has no rows, and the table API path already creates the
+    # table from it -- so the two paths agreed on everything except this, where
+    # the default local path was the one that failed.
+    effective_schema = schema if schema is not None else _arrow_schema(ds)
+    if effective_schema is None:
         raise RuntimeError(
             f"Wrote a Lance dataset to {dataset_uri!r} but database {spec.uri!r} "
-            f"cannot open a table named {table!r}. If the input was empty, pass "
-            "schema=... so the table can be created from it."
+            f"cannot open a table named {table!r}. The input was empty and Ray "
+            "reported no schema for it, so pass schema=... to create the table."
         ) from resolve_error
 
     _create_empty_dataset(
         dataset_uri,
-        schema,
+        effective_schema,
         spec,
         data_storage_version=data_storage_version,
         enable_stable_row_ids=enable_stable_row_ids,
@@ -685,6 +766,39 @@ def _write_local_fragments(
             f"Created an empty Lance dataset at {dataset_uri!r} but database "
             f"{spec.uri!r} still cannot open a table named {table!r}."
         ) from error
+
+
+def _arrow_schema(ds: Dataset) -> Optional[pa.Schema]:
+    """The dataset's own Arrow schema, or ``None`` if Ray cannot report one.
+
+    Only called on the recovery path, where the write produced no fragments and
+    the input was therefore empty -- so ``fetch_if_missing`` re-executes an
+    empty plan rather than real work. ``Dataset.schema`` returns Ray's wrapper,
+    which carries the Arrow schema underneath.
+    """
+    try:
+        reported = ds.schema(fetch_if_missing=True)
+    except Exception as error:  # noqa: BLE001 - a missing schema is not fatal
+        logger.debug("Could not resolve the dataset schema: %s", error)
+        return None
+    base = getattr(reported, "base_schema", reported)
+    return base if isinstance(base, pa.Schema) else None
+
+
+def _input_row_count(ds: Dataset) -> Optional[int]:
+    """How many rows the input held, or ``None`` if Ray would not say.
+
+    Only called on the recovery path, where the write produced no dataset. For
+    the case that path exists to serve -- an input with no rows -- counting
+    executes an empty plan. For any other cause it costs a re-execution on the
+    way to raising, which is the right trade against silently standing an empty
+    table where a completed write should be.
+    """
+    try:
+        return int(ds.count())
+    except Exception as error:  # noqa: BLE001 - cannot tell; must not assume
+        logger.debug("Could not count the input dataset: %s", error)
+        return None
 
 
 def _dataset_state(dataset_uri: str, spec: LanceDBConnectionSpec) -> _DatasetState:

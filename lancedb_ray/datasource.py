@@ -35,12 +35,20 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["LanceDBDatasource", "RemoteReadStrategy"]
+__all__ = [
+    "DEFAULT_BATCH_SIZE",
+    "LanceDBDatasource",
+    "RemoteReadStrategy",
+    "validate_columns",
+]
 
 RemoteReadStrategy = Literal["auto", "offsets", "pagination", "single"]
 
 #: Rows sampled to estimate the in-memory size of a remote table.
 _SIZE_SAMPLE_ROWS = 32
+
+#: Rows fetched per request by a remote read task when the caller names none.
+DEFAULT_BATCH_SIZE = 50_000
 
 
 def _build_block_metadata(
@@ -67,20 +75,44 @@ def _build_block_metadata(
     )
 
 
-def _apply_columns(query: Any, columns: Optional[list[str]]) -> Any:
-    """Apply a column projection to a query builder, if one was requested.
+def _build_read_task(
+    read_fn: Any, metadata: BlockMetadata, row_limit: Optional[int]
+) -> ReadTask:
+    """Construct a ``ReadTask``, passing the row limit where Ray accepts it.
+
+    Ray slices a task's blocks down to ``per_task_row_limit`` itself, which is
+    what makes the limit a guarantee rather than a promise each strategy has to
+    remember to keep. Probed rather than version-pinned, like
+    :func:`_build_block_metadata`.
+    """
+    if row_limit is None:
+        return ReadTask(read_fn, metadata)
+    if "per_task_row_limit" in inspect.signature(ReadTask.__init__).parameters:
+        return ReadTask(read_fn, metadata, per_task_row_limit=row_limit)
+    return ReadTask(read_fn, metadata)
+
+
+def validate_columns(columns: Optional[list[str]]) -> None:
+    """Reject a projection that names no columns.
 
     ``None`` means no projection; an empty list is a caller mistake rather than
     a request for nothing, and silently returning every column would be the
-    opposite of what was asked for.
+    opposite of what was asked for. Checked on the driver so the job fails
+    before any task is scheduled, and checked again in :func:`_apply_columns`
+    because a datasource can be constructed directly.
     """
-    if columns is None:
-        return query
-    if not columns:
+    if columns is not None and not columns:
         raise ValueError(
             "columns=[] selects no columns. Pass columns=None (the default) to "
             "read every column, or name the ones you want."
         )
+
+
+def _apply_columns(query: Any, columns: Optional[list[str]]) -> Any:
+    """Apply a column projection to a query builder, if one was requested."""
+    if columns is None:
+        return query
+    validate_columns(columns)
     return query.select(columns)
 
 
@@ -181,11 +213,17 @@ def _read_single(
     batch_size: int,
     retry_policy: RetryPolicy,
     schema: Optional[pa.Schema],
+    row_limit: Optional[int] = None,
 ) -> Iterator[pa.Table]:
     """Stream the whole table through a single task.
 
     The escape hatch for cases where sharding is undesirable -- notably a
     highly selective filter, where paging costs more than a single scan.
+
+    ``row_limit`` is pushed into the query rather than left to Ray to trim
+    afterwards: the sharded strategies express a downstream ``limit`` by
+    shrinking their offset range, and a single task that streamed the whole
+    table regardless would read the entire table to answer a ``.limit(10)``.
     """
     table = open_table(spec, table_name, version=version)
 
@@ -193,7 +231,10 @@ def _read_single(
         query = table.search(None)
         if filter_:
             query = query.where(filter_)
-        return _apply_columns(query, columns).to_batches(batch_size)
+        query = _apply_columns(query, columns)
+        if row_limit is not None:
+            query = query.limit(row_limit)
+        return query.to_batches(batch_size)
 
     batches = call_with_retry(
         fetch, retry_policy, description=f"streaming read of {table_name}"
@@ -234,7 +275,7 @@ class LanceDBDatasource(Datasource):
         filter: Optional[str] = None,
         version: Optional[Union[int, str]] = None,
         strategy: RemoteReadStrategy = "auto",
-        batch_size: int = 50_000,
+        batch_size: int = DEFAULT_BATCH_SIZE,
         retry_policy: Optional[RetryPolicy] = None,
     ) -> None:
         if batch_size <= 0:
@@ -245,9 +286,11 @@ class LanceDBDatasource(Datasource):
                 f"strategy must be one of {valid_strategies}, got {strategy!r}"
             )
 
+        validate_columns(columns)
+
         self._spec = spec
         self._table_name = table_name
-        self._columns = list(columns) if columns else None
+        self._columns = list(columns) if columns is not None else None
         self._filter = filter
         self._batch_size = batch_size
         self._retry_policy = retry_policy or RetryPolicy()
@@ -257,8 +300,14 @@ class LanceDBDatasource(Datasource):
         self._version: Union[int, str] = (
             version if version is not None else table.version
         )
-        if version is not None:
-            table.checkout(version)
+        # Pin *before* sizing the scan, not only when a version was named. The
+        # row count decides how the row space is split, and the read tasks then
+        # pin ``self._version``; sizing against whatever "latest" meant a moment
+        # later lets a commit landing in between plan shards for a version the
+        # workers will not read. A shrinking commit drops the rows past the new
+        # end silently, because ``take_offsets`` truncates rather than raising.
+        # This handle is always freshly opened, so checking it out is local.
+        table.checkout(self._version)
 
         self._schema: Optional[pa.Schema] = getattr(table, "schema", None)
         self._num_rows: int = table.count_rows(filter) if filter else table.count_rows()
@@ -339,13 +388,20 @@ class LanceDBDatasource(Datasource):
                 self._batch_size,
                 self._retry_policy,
                 self._schema,
+                per_task_row_limit,
             )
             rows = (
                 self._num_rows
                 if per_task_row_limit is None
                 else min(self._num_rows, per_task_row_limit)
             )
-            return [ReadTask(read_fn, _build_block_metadata(rows, self._schema))]
+            return [
+                _build_read_task(
+                    read_fn,
+                    _build_block_metadata(rows, self._schema),
+                    per_task_row_limit,
+                )
+            ]
 
         shards = plan_offset_shards(self._num_rows, parallelism)
         if per_task_row_limit is not None:
@@ -383,6 +439,10 @@ class LanceDBDatasource(Datasource):
                     self._schema,
                 )
             read_tasks.append(
-                ReadTask(read_fn, _build_block_metadata(shard.num_rows, self._schema))
+                _build_read_task(
+                    read_fn,
+                    _build_block_metadata(shard.num_rows, self._schema),
+                    per_task_row_limit,
+                )
             )
         return read_tasks

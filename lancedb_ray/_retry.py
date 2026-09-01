@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import random
+import re
 import time
 from collections.abc import Callable
 
@@ -34,11 +35,21 @@ _TRANSIENT_MARKERS = (
     "internal server error",
     "bad gateway",
     "gateway timeout",
-    "502",
-    "503",
-    "504",
-    "429",
 )
+
+
+def _status_pattern(*codes: str) -> re.Pattern[str]:
+    """Match an HTTP status code as a whole number, not as digits anywhere.
+
+    A bare substring test reads ``429`` out of "dimension 1429" and ``503`` out
+    of "row 8503", classifying a deterministic schema error as retryable. Word
+    boundaries keep a code from matching inside a longer number, which is how
+    row counts, dimensions and byte sizes reach these messages.
+    """
+    return re.compile(rf"\b(?:{'|'.join(codes)})\b")
+
+
+_TRANSIENT_STATUS = _status_pattern("429", "502", "503", "504")
 
 _COMMIT_CONFLICT_MARKERS = (
     "commit conflict",
@@ -52,7 +63,9 @@ _COMMIT_CONFLICT_MARKERS = (
 def is_transient(error: BaseException) -> bool:
     """Return whether ``error`` looks like a retryable transient failure."""
     message = str(error).lower()
-    return any(marker in message for marker in _TRANSIENT_MARKERS)
+    if any(marker in message for marker in _TRANSIENT_MARKERS):
+        return True
+    return _TRANSIENT_STATUS.search(message) is not None
 
 
 #: Failures that mean the request never reached the service, or was rejected
@@ -62,12 +75,12 @@ _NOT_APPLIED_MARKERS = (
     "temporarily unavailable",
     "service unavailable",
     "too many requests",
-    "429",
-    "503",
     "name or service not known",
     "nodename nor servname",
     "failed to resolve",
 )
+
+_NOT_APPLIED_STATUS = _status_pattern("429", "503")
 
 
 def is_definitely_not_applied(error: BaseException) -> bool:
@@ -79,7 +92,9 @@ def is_definitely_not_applied(error: BaseException) -> bool:
     this narrower class.
     """
     message = str(error).lower()
-    return any(marker in message for marker in _NOT_APPLIED_MARKERS)
+    if any(marker in message for marker in _NOT_APPLIED_MARKERS):
+        return True
+    return _NOT_APPLIED_STATUS.search(message) is not None
 
 
 #: Arrow-rs refuses to import a buffer whose pointer is not aligned for its

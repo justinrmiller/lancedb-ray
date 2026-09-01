@@ -79,8 +79,8 @@ Requires Python 3.12 or newer. CI tests against 3.12.
 | `columns`, `filter` | Projection and SQL predicate, evaluated server-side |
 | `version` | Table version to pin (defaults to current) |
 | `remote_read_strategy` | `auto` (default), `offsets`, `pagination`, `single` |
-| `batch_size` | Rows per request issued by each remote read task |
-| `scanner_options` | Extra Lance scanner options for a local read — `batch_size`, `use_scalar_index`, `late_materialization`, `with_row_id` |
+| `batch_size` | Rows per read request — sizes each task's requests remotely, and the Lance scanner's batches locally |
+| `scanner_options` | Extra Lance scanner options for a local read — `use_scalar_index`, `late_materialization`, `with_row_id` |
 | `api_key`, `region`, `host_override` | Cloud/Enterprise connection |
 | `storage_options`, `client_config` | Object-store and HTTP client options |
 | `namespace_client_impl`, `namespace_client_properties` | Lance Namespace resolution |
@@ -203,8 +203,10 @@ that to be true.
   default because it is the one with guaranteed positional semantics. If you are pushing
   volume through Enterprise, `pagination` is worth measuring against your endpoint.
 - **`batch_size` sets round trips, not total payload.** The same offsets are sent either
-  way, just in fewer requests, so raising it mostly buys fewer round trips. It defaults
-  to 50,000.
+  way, just in fewer requests, so raising it mostly buys fewer round trips. Left unset it
+  uses each backend's own sizing — 50,000 rows per request remotely, and the Lance
+  scanner's default locally. Setting it takes precedence over a `batch_size` named in
+  `scanner_options`, the same way `columns` and `filter` do.
 - **For a highly selective filter over a large table**, `remote_read_strategy="single"`
   streams the result through one task and often beats sharding it.
 - **API keys should come from `LANCEDB_API_KEY`** rather than the `api_key` argument, so

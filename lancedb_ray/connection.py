@@ -13,7 +13,7 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from functools import cache, lru_cache
+from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Optional, Union, cast
 
 if TYPE_CHECKING:
@@ -204,7 +204,15 @@ class LanceDBConnectionSpec:
         )
 
 
-@cache
+#: Live connections held per worker process. Bounded rather than unbounded:
+#: the cache key includes the resolved API key, so a process whose credentials
+#: rotate accumulates one entry per key it has ever seen, each holding sockets
+#: and a thread pool. Comfortably above the one or two specs a worker really
+#: uses, so eviction is not something a normal job reaches.
+_CONNECTION_CACHE_SIZE = 8
+
+
+@lru_cache(maxsize=_CONNECTION_CACHE_SIZE)
 def _connect_cached(
     spec: LanceDBConnectionSpec, resolved_api_key: Optional[str]
 ) -> lancedb.DBConnection:
