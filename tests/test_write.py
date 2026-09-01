@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import lance
@@ -18,6 +19,22 @@ def version_count(db_dir: str, name: str = "items") -> int:
     """Number of committed versions of a table's backing Lance dataset."""
     versions = lance.dataset(f"{db_dir}/{name}.lance").versions()  # type: ignore[no-untyped-call]
     return len(versions)
+
+
+def file_versions(db_dir: str, name: str = "items") -> list[tuple[int, int]]:
+    """The Lance file format version of each data file in a table."""
+    ds = lance.dataset(f"{db_dir}/{name}.lance")  # type: ignore[no-untyped-call]
+    versions = []
+    for fragment in ds.get_fragments():
+        # to_json() returns a dict on current lance and a JSON string on older
+        # ones; accept either rather than pinning the test to one.
+        raw = fragment.metadata.to_json()
+        meta = raw if isinstance(raw, dict) else json.loads(raw)
+        for data_file in meta["files"]:
+            versions.append(
+                (data_file["file_major_version"], data_file["file_minor_version"])
+            )
+    return versions
 
 
 def dataset_of(table: pa.Table, blocks: int = 1) -> ray.data.Dataset:
@@ -815,13 +832,70 @@ class TestFragmentWriteOptions:
             "items",
             uri=db_dir,
             mode="create",
-            data_storage_version="stable",
+            data_storage_version="2.1",
         )
+
         assert read_lancedb("items", uri=db_dir).count() == 50
+        # Assert the version reached the files. A row count would pass whether
+        # or not the option was wired through, which is how a dropped
+        # pass-through stays invisible.
+        assert file_versions(db_dir) == [(2, 1)]
+
+    def test_a_different_storage_version_is_distinguishable(self, db_dir: str) -> None:
+        """The previous test only means something if the value can differ."""
+        write_lancedb(
+            dataset_of(make_table(50)),
+            "items",
+            uri=db_dir,
+            mode="create",
+            data_storage_version="2.0",
+        )
+        assert file_versions(db_dir) == [(2, 0)]
 
     def test_default_write_leaves_both_alone(self, db_dir: str) -> None:
         write_lancedb(dataset_of(make_table(20)), "items", uri=db_dir, mode="create")
         assert read_lancedb("items", uri=db_dir).count() == 20
+
+    def test_an_empty_input_still_honours_stable_row_ids(self, db_dir: str) -> None:
+        """The empty-input fallback must not quietly drop these.
+
+        An empty input produces no fragments, so the table is materialised from
+        the schema instead. Creating it through the database would lose
+        ``enable_stable_row_ids`` -- and because stable IDs are fixed at
+        creation, every later append to that table would silently lack them
+        with no way back short of a rewrite.
+        """
+        empty = make_table(0)
+        write_lancedb(
+            dataset_of(empty),
+            "items",
+            uri=db_dir,
+            mode="create",
+            schema=empty.schema,
+            enable_stable_row_ids=True,
+        )
+        write_lancedb(dataset_of(make_table(50)), "items", uri=db_dir, mode="append")
+
+        ds = lance.dataset(f"{db_dir}/items.lance")  # type: ignore[no-untyped-call]
+        fragments = ds.get_fragments()
+        assert fragments and all(f.metadata.row_id_meta is not None for f in fragments)
+        assert read_lancedb("items", uri=db_dir).count() == 50
+
+    def test_an_empty_input_still_honours_the_storage_version(
+        self, db_dir: str
+    ) -> None:
+        empty = make_table(0)
+        write_lancedb(
+            dataset_of(empty),
+            "items",
+            uri=db_dir,
+            mode="create",
+            schema=empty.schema,
+            data_storage_version="2.0",
+        )
+        write_lancedb(dataset_of(make_table(10)), "items", uri=db_dir, mode="append")
+
+        assert file_versions(db_dir) == [(2, 0)]
 
     def test_refused_against_cloud_enterprise(
         self, remote_uri: str, remote_kwargs: dict[str, Any]

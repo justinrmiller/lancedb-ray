@@ -199,12 +199,13 @@ class LanceDBDatasink(Datasink[WriteStats]):
         min_rows_per_write: Rows accumulated before a request is issued.
         max_rows_per_request: Ceiling on rows in a single request; larger
             accumulations are split.
-        max_bytes_per_request: Ceiling on the in-memory size of a single
-            request. A row ceiling alone does not bound memory -- a row holding
-            a 1536-dimension embedding is 6KB and one holding a JPEG is
-            unbounded -- so a wide enough schema exhausts the worker long
-            before ``max_rows_per_request`` is reached. Whichever ceiling a
-            request meets first closes it.
+        max_bytes_per_request: Ceiling on the size of a single request's
+            payload. A row ceiling is a poor proxy for size -- a row holding a
+            1536-dimension embedding is 6KB and one holding a JPEG is unbounded
+            -- so a wide enough schema makes ``max_rows_per_request``
+            meaningless as a bound. Whichever ceiling a request meets first
+            closes it. Neither lowers the task's peak memory, which is fixed by
+            how many rows Ray bundles into the task.
         transform_fn: Optional per-batch transform applied before writing,
             for enrichment such as computing embeddings.
         when_matched_update_all: For upserts, update rows that matched.

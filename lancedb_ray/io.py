@@ -340,13 +340,15 @@ def write_lancedb(
             append switches that write to the API path.
         min_rows_per_write: Rows accumulated per request on the API path.
         max_rows_per_request: Ceiling on rows in a single request.
-        max_bytes_per_request: Ceiling on the in-memory size of a single
-            request, on the API path. Rows are a poor proxy for memory once a
+        max_bytes_per_request: Ceiling on the size of a single request's
+            payload, on the API path. Rows are a poor proxy for size once a
             schema is wide -- 256K rows of a 1536-dimension float32 embedding is
-            1.5GB before anything else in the row is counted -- so this is the
-            ceiling to set when a task is being killed for memory rather than
-            taking too long. Combines with ``max_rows_per_request``; whichever
-            is met first closes the request.
+            1.5GB before anything else in the row is counted -- so this bounds
+            what one transaction hands to LanceDB in the unit that matters.
+            Combines with ``max_rows_per_request``; whichever is met first
+            closes the request. Note this does **not** lower the task's peak
+            memory: a task materialises all of its rows before either ceiling
+            applies, so ``rows_per_transaction`` is the knob for that.
         when_matched_update_all: For upserts, update rows that matched.
         when_not_matched_insert_all: For upserts, insert rows that did not match.
         when_not_matched_by_source_delete: For upserts, delete unmatched target
@@ -637,7 +639,13 @@ def _write_local_fragments(
     # a reasonable thing to do -- a job whose filter matched nothing still wants
     # its table -- so materialise it from the schema instead of failing.
     if schema is not None:
-        connect(spec).create_table(table, schema=schema, mode="overwrite")
+        _create_empty_dataset(
+            dataset_uri,
+            schema,
+            spec,
+            data_storage_version=data_storage_version,
+            enable_stable_row_ids=enable_stable_row_ids,
+        )
         return
 
     raise RuntimeError(
@@ -722,4 +730,44 @@ def _finish_empty_overwrite(
         "table rather than leaving its previous contents in place.",
         table,
     )
+    # ``create_table`` is safe here in a way it is not for an empty *create*:
+    # overwriting an existing dataset makes a new version of it, so the
+    # manifest's ``enable_stable_row_ids`` and file format version carry over
+    # (verified). A create has no manifest to inherit from, which is why that
+    # path writes through lance directly instead.
     connect(spec).create_table(table, schema=effective_schema, mode="overwrite")
+
+
+def _create_empty_dataset(
+    dataset_uri: str,
+    schema: pa.Schema,
+    spec: LanceDBConnectionSpec,
+    *,
+    data_storage_version: Optional[str],
+    enable_stable_row_ids: bool,
+) -> None:
+    """Materialise a zero-row Lance dataset the database can open.
+
+    Written through ``lance`` rather than ``create_table`` for the sake of the
+    options. ``enable_stable_row_ids`` is fixed when a dataset is created and
+    ``create_table`` has no parameter for it, so routing the empty case through
+    the database would quietly produce a table that can never have stable row
+    IDs -- the exact outcome the option exists to let a caller avoid, and one
+    they would discover only when a later job needed the IDs. Writing Lance
+    files at this URI and letting the database resolve them afterwards is also
+    what the non-empty path already does.
+    """
+    import lance
+
+    lance.write_dataset(
+        pa.Table.from_pylist([], schema=schema),
+        dataset_uri,
+        mode="overwrite",
+        # lance types this as a Literal over the versions it knows today.
+        # Mirroring that set here would reject a version a newer lance accepts,
+        # so pass the string through and let lance reject a bad one -- which it
+        # does, by name.
+        data_storage_version=cast("Any", data_storage_version),
+        enable_stable_row_ids=enable_stable_row_ids,
+        storage_options=dict(spec.storage_options) if spec.storage_options else None,
+    )

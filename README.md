@@ -97,7 +97,7 @@ Requires Python 3.12 or newer. CI tests against 3.12.
 | `local_write_strategy` | `auto` (default), `fragment`, `api` |
 | `rows_per_transaction` | Rows Ray bundles per write task = transaction size |
 | `max_rows_per_request` | Optional row ceiling; splits a task into several transactions |
-| `max_bytes_per_request` | Optional memory ceiling in bytes — the one that actually bounds a wide schema |
+| `max_bytes_per_request` | Optional ceiling on a request's payload in bytes — the one that bounds a wide schema |
 | `write_parallelism` | Parts the client uploads concurrently within one transaction |
 | `data_storage_version`, `enable_stable_row_ids` | Lance file format and row-ID stability for the fragment path |
 | `when_matched_update_all`, `when_not_matched_insert_all`, `when_not_matched_by_source_delete` | Merge-insert semantics |
@@ -174,13 +174,18 @@ that to be true.
 - **`on_batch_error` defaults to `raise`.** Logging a failed write and continuing lets a
   job report success while having silently lost data. `skip` is available when partial
   completion genuinely is preferable, and dropped rows are counted and warned about.
-- **Cap a task's memory in bytes, not rows.** A task holds its rows in memory so a
-  failed write can be retried, so a large `rows_per_transaction` raises peak worker
-  memory. A row count is a poor proxy for that: the default 262,144 rows is a few MB of
-  scalars but 1.5GB of 1536-dimension embeddings, and unbounded if a row carries an
-  image. `max_bytes_per_request` sets the ceiling in the unit that actually runs out;
-  `max_rows_per_request` still works and the two combine, whichever is met first closing
-  the request. Either costs extra transactions.
+- **`rows_per_transaction` sets task memory; the per-request ceilings set payload
+  size.** A task holds all of its rows in memory so a failed write can be retried, and it
+  materialises them before either ceiling is consulted — so peak worker memory is set by
+  `rows_per_transaction` alone. That is the knob to turn down when a task is being
+  OOM-killed, and it is worth sizing in bytes rather than rows: 262,144 rows is a few MB
+  of scalars but 1.5GB of 1536-dimension embeddings, and unbounded if a row carries an
+  image.
+
+  `max_rows_per_request` and `max_bytes_per_request` bound something narrower — how much
+  of that already-materialised data is handed to LanceDB per transaction, and so how much
+  the client encodes and uploads at once. Both may be set and the tighter one closes the
+  request. Either costs extra transactions.
 
 - **`enable_stable_row_ids` is decided at creation.** Stable IDs survive compaction,
   which is what lets a later job address a row it saw earlier. They are off by default
