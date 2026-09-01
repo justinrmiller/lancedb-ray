@@ -101,6 +101,42 @@ class TestVersionPinning:
     def test_explicit_version_is_used(self, spec: LanceDBConnectionSpec) -> None:
         assert LanceDBDatasource(spec, "items", version=1).version == 1
 
+    @pytest.mark.parametrize("version", [None, 1])
+    def test_the_scan_is_sized_after_the_version_is_pinned(
+        self,
+        spec: LanceDBConnectionSpec,
+        monkeypatch: pytest.MonkeyPatch,
+        version: Any,
+    ) -> None:
+        """Sizing an unpinned handle lets a concurrent commit skew the plan.
+
+        The row count decides the shard boundaries and the read tasks pin the
+        captured version, so a count taken against "latest" can plan a row
+        space the workers never see. ``take_offsets`` truncates silently past
+        the end, so the mismatch never surfaces as an error.
+        """
+        import _fakes
+
+        calls: list[str] = []
+        real_checkout = _fakes.FakeRemoteTable.checkout
+        real_count = _fakes.FakeRemoteTable.count_rows
+
+        def spy_checkout(self: Any, v: Any) -> Any:
+            calls.append("checkout")
+            return real_checkout(self, v)
+
+        def spy_count(self: Any, filter: Any = None) -> Any:
+            calls.append("count_rows")
+            return real_count(self, filter)
+
+        monkeypatch.setattr(_fakes.FakeRemoteTable, "checkout", spy_checkout)
+        monkeypatch.setattr(_fakes.FakeRemoteTable, "count_rows", spy_count)
+
+        LanceDBDatasource(spec, "items", version=version)
+
+        assert "checkout" in calls, "the driver never pinned the handle"
+        assert calls.index("checkout") < calls.index("count_rows")
+
 
 class TestReadTaskPlanning:
     def test_one_task_per_requested_shard(self, spec: LanceDBConnectionSpec) -> None:

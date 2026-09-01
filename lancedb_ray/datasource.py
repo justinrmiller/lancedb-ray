@@ -292,8 +292,14 @@ class LanceDBDatasource(Datasource):
         self._version: Union[int, str] = (
             version if version is not None else table.version
         )
-        if version is not None:
-            table.checkout(version)
+        # Pin *before* sizing the scan, not only when a version was named. The
+        # row count decides how the row space is split, and the read tasks then
+        # pin ``self._version``; sizing against whatever "latest" meant a moment
+        # later lets a commit landing in between plan shards for a version the
+        # workers will not read. A shrinking commit drops the rows past the new
+        # end silently, because ``take_offsets`` truncates rather than raising.
+        # This handle is always freshly opened, so checking it out is local.
+        table.checkout(self._version)
 
         self._schema: Optional[pa.Schema] = getattr(table, "schema", None)
         self._num_rows: int = table.count_rows(filter) if filter else table.count_rows()
