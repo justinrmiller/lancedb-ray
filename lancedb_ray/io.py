@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping
+from enum import Enum
 from typing import Any, Literal, Optional, Union, cast
 
 import pyarrow as pa
@@ -44,6 +45,17 @@ LocalWriteStrategy = Literal["auto", "fragment", "api"]
 
 #: Block count used to hash-partition an upsert when nothing better is known.
 _DEFAULT_UPSERT_PARTITIONS = 16
+
+
+class _DatasetState(Enum):
+    """What we could establish about a dataset URI after a write."""
+
+    #: Nothing is there -- the write produced no fragments, so the input was empty.
+    ABSENT = "absent"
+    #: A dataset opened; it holds the rows that were written.
+    PRESENT = "present"
+    #: Storage could not answer. Treated as PRESENT would be, never as ABSENT.
+    UNKNOWN = "unknown"
 
 
 def _build_spec(
@@ -98,6 +110,7 @@ def read_lancedb(
     version: Optional[Union[int, str]] = None,
     remote_read_strategy: RemoteReadStrategy = "auto",
     batch_size: int = 50_000,
+    scanner_options: Optional[Mapping[str, Any]] = None,
     ray_remote_args: Optional[dict[str, Any]] = None,
     concurrency: Optional[int] = None,
     override_num_blocks: Optional[int] = None,
@@ -143,6 +156,13 @@ def read_lancedb(
         remote_read_strategy: Remote sharding strategy -- ``auto`` (default),
             ``offsets``, ``pagination`` or ``single``. Ignored for local tables.
         batch_size: Rows per request issued by each remote read task.
+        scanner_options: Extra options for the Lance scanner on **local** reads
+            -- ``batch_size``, ``use_scalar_index``, ``late_materialization``,
+            ``with_row_id`` and friends. Without this the local scan is only
+            tunable through ``columns`` and ``filter``, which leaves the scan
+            knobs that matter for a wide table unreachable. ``columns`` and
+            ``filter`` are set from their own arguments and win over anything
+            named here. Rejected for ``db://`` URIs, which have no scanner.
         ray_remote_args: Resource arguments for the read tasks.
         concurrency: Maximum number of concurrent read tasks.
         override_num_blocks: Override the number of output blocks.
@@ -169,9 +189,18 @@ def read_lancedb(
             columns=columns,
             filter=filter,
             version=version,
+            scanner_options=scanner_options,
             ray_remote_args=ray_remote_args,
             concurrency=concurrency,
             override_num_blocks=override_num_blocks,
+        )
+
+    if scanner_options:
+        # Silently dropping these would look like a tuning that did nothing.
+        raise ValueError(
+            "scanner_options applies to the Lance scanner, which only exists "
+            f"for local tables; {uri!r} is Cloud/Enterprise. Use batch_size and "
+            "remote_read_strategy to tune a remote read."
         )
 
     datasource = LanceDBDatasource(
@@ -201,6 +230,7 @@ def _read_local(
     columns: Optional[list[str]],
     filter: Optional[str],
     version: Optional[Union[int, str]],
+    scanner_options: Optional[Mapping[str, Any]],
     ray_remote_args: Optional[dict[str, Any]],
     concurrency: Optional[int],
     override_num_blocks: Optional[int],
@@ -224,6 +254,7 @@ def _read_local(
         filter=filter,
         storage_options=dict(spec.storage_options) if spec.storage_options else None,
         dataset_options={"version": pinned},
+        scanner_options=dict(scanner_options) if scanner_options else None,
         ray_remote_args=ray_remote_args,
         concurrency=concurrency,
         override_num_blocks=override_num_blocks,
@@ -249,6 +280,7 @@ def write_lancedb(
     transform_fn: Optional[TransformFn] = None,
     rows_per_transaction: int = 256 * 1024,
     max_rows_per_request: Optional[int] = None,
+    max_bytes_per_request: Optional[int] = None,
     write_parallelism: Optional[int] = None,
     when_matched_update_all: bool = True,
     when_not_matched_insert_all: bool = True,
@@ -257,6 +289,8 @@ def write_lancedb(
     local_write_strategy: LocalWriteStrategy = "auto",
     max_rows_per_file: int = 1024 * 1024,
     min_rows_per_file: int = 1024,
+    data_storage_version: Optional[str] = None,
+    enable_stable_row_ids: bool = False,
     retry_policy: Optional[RetryPolicy] = None,
     ray_remote_args: Optional[dict[str, Any]] = None,
     concurrency: Optional[int] = None,
@@ -318,6 +352,15 @@ def write_lancedb(
             append switches that write to the API path.
         min_rows_per_write: Rows accumulated per request on the API path.
         max_rows_per_request: Ceiling on rows in a single request.
+        max_bytes_per_request: Ceiling on the size of a single request's
+            payload, on the API path. Rows are a poor proxy for size once a
+            schema is wide -- 256K rows of a 1536-dimension float32 embedding is
+            1.5GB before anything else in the row is counted -- so this bounds
+            what one transaction hands to LanceDB in the unit that matters.
+            Combines with ``max_rows_per_request``; whichever is met first
+            closes the request. Note this does **not** lower the task's peak
+            memory: a task materialises all of its rows before either ceiling
+            applies, so ``rows_per_transaction`` is the knob for that.
         when_matched_update_all: For upserts, update rows that matched.
         when_not_matched_insert_all: For upserts, insert rows that did not match.
         when_not_matched_by_source_delete: For upserts, delete unmatched target
@@ -334,6 +377,13 @@ def write_lancedb(
             applies; ``fragment`` forces it; ``api`` forces the table API.
         max_rows_per_file: Fragment sizing for the fragment path.
         min_rows_per_file: Fragment sizing for the fragment path.
+        data_storage_version: Lance file format version for newly written
+            fragments (``"stable"``, ``"2.1"``, ...). Fragment path only.
+        enable_stable_row_ids: Give rows IDs that survive compaction, on the
+            fragment path. Off by default because it costs an index, but it is
+            fixed when the dataset is created -- a table written without it
+            cannot be switched later without a rewrite -- so it is worth
+            deciding at creation rather than discovering afterwards.
         retry_policy: Retry behaviour for failed batches on the API path.
         ray_remote_args: Resource arguments for the write tasks.
         concurrency: Maximum number of concurrent write tasks. Local upserts
@@ -386,10 +436,17 @@ def write_lancedb(
             schema=schema,
             max_rows_per_file=max_rows_per_file,
             min_rows_per_file=min_rows_per_file,
+            data_storage_version=data_storage_version,
+            enable_stable_row_ids=enable_stable_row_ids,
             ray_remote_args=ray_remote_args,
             concurrency=concurrency,
         )
         return
+
+    _reject_fragment_only_options(
+        data_storage_version=data_storage_version,
+        enable_stable_row_ids=enable_stable_row_ids,
+    )
 
     if concurrency is None and not spec.is_remote and mode == "upsert":
         # Hash partitioning already rules out same-key races; this cap is purely
@@ -407,6 +464,7 @@ def write_lancedb(
         schema=schema,
         rows_per_transaction=rows_per_transaction,
         max_rows_per_request=max_rows_per_request,
+        max_bytes_per_request=max_bytes_per_request,
         write_parallelism=write_parallelism,
         transform_fn=transform_fn,
         when_matched_update_all=when_matched_update_all,
@@ -418,6 +476,30 @@ def write_lancedb(
     ds.write_datasink(
         datasink, ray_remote_args=ray_remote_args, concurrency=concurrency
     )
+
+
+def _reject_fragment_only_options(
+    *, data_storage_version: Optional[str], enable_stable_row_ids: bool
+) -> None:
+    """Refuse fragment-path options on a write that will not take that path.
+
+    Both are properties of the Lance files a fragment write produces, so the
+    table API has nowhere to put them. Accepting and ignoring them would be
+    worse than refusing: ``enable_stable_row_ids`` is fixed at dataset creation,
+    so a caller who thinks they enabled it and did not finds out only when they
+    need the IDs and the dataset has to be rewritten.
+    """
+    unusable = []
+    if data_storage_version is not None:
+        unusable.append("data_storage_version")
+    if enable_stable_row_ids:
+        unusable.append("enable_stable_row_ids")
+    if unusable:
+        raise ValueError(
+            f"{', '.join(unusable)} only applies to the local fragment write "
+            "path, which this write does not take (Cloud/Enterprise, "
+            "mode='upsert' or local_write_strategy='api')."
+        )
 
 
 def _can_race(concurrency: Optional[int]) -> bool:
@@ -501,6 +583,8 @@ def _write_local_fragments(
     schema: Optional[pa.Schema],
     max_rows_per_file: int,
     min_rows_per_file: int,
+    data_storage_version: Optional[str],
+    enable_stable_row_ids: bool,
     ray_remote_args: Optional[dict[str, Any]],
     concurrency: Optional[int],
 ) -> None:
@@ -544,6 +628,8 @@ def _write_local_fragments(
         mode=lance_mode,
         max_rows_per_file=max_rows_per_file,
         min_rows_per_file=min_rows_per_file,
+        data_storage_version=data_storage_version,
+        enable_stable_row_ids=enable_stable_row_ids,
         storage_options=dict(spec.storage_options) if spec.storage_options else None,
         ray_remote_args=ray_remote_args,
         concurrency=concurrency,
@@ -560,19 +646,72 @@ def _write_local_fragments(
     except Exception as error:  # noqa: BLE001 - one recoverable case below
         resolve_error = error
 
-    # A dataset with no rows produces no fragments, and therefore no manifest
-    # for the database to open. Asking to create a table from an empty input is
-    # a reasonable thing to do -- a job whose filter matched nothing still wants
-    # its table -- so materialise it from the schema instead of failing.
-    if schema is not None:
-        connect(spec).create_table(table, schema=schema, mode="overwrite")
-        return
+    # Exactly one failure here is recoverable: an input with no rows produces
+    # no fragments and so no dataset at all, leaving nothing for the database
+    # to open. Every other cause -- a transient catalog error, a permission
+    # fault, a race -- means the rows *are* on disk, and recovering by writing
+    # an empty dataset over them would destroy a completed write and report
+    # success. So establish which case this is before assuming.
+    if _dataset_state(dataset_uri, spec) is not _DatasetState.ABSENT:
+        raise RuntimeError(
+            f"Wrote a Lance dataset to {dataset_uri!r} but database "
+            f"{spec.uri!r} cannot open a table named {table!r}. The data is "
+            "there -- this is a resolution failure, not an empty write, so it "
+            "is left untouched rather than replaced with an empty table."
+        ) from resolve_error
 
-    raise RuntimeError(
-        f"Wrote a Lance dataset to {dataset_uri!r} but database {spec.uri!r} "
-        f"cannot open a table named {table!r}. If the input was empty, pass "
-        "schema=... so the table can be created from it."
-    ) from resolve_error
+    # A job whose filter matched nothing still wants its table, so materialise
+    # it from the schema rather than failing.
+    if schema is None:
+        raise RuntimeError(
+            f"Wrote a Lance dataset to {dataset_uri!r} but database {spec.uri!r} "
+            f"cannot open a table named {table!r}. If the input was empty, pass "
+            "schema=... so the table can be created from it."
+        ) from resolve_error
+
+    _create_empty_dataset(
+        dataset_uri,
+        schema,
+        spec,
+        data_storage_version=data_storage_version,
+        enable_stable_row_ids=enable_stable_row_ids,
+    )
+    # Writing the files is not the same as the database being able to resolve
+    # them. Confirm rather than return an unverified success.
+    try:
+        connect(spec).open_table(table)
+    except Exception as error:
+        raise RuntimeError(
+            f"Created an empty Lance dataset at {dataset_uri!r} but database "
+            f"{spec.uri!r} still cannot open a table named {table!r}."
+        ) from error
+
+
+def _dataset_state(dataset_uri: str, spec: LanceDBConnectionSpec) -> _DatasetState:
+    """Establish whether a Lance dataset was materialised at ``dataset_uri``.
+
+    The answer decides whether it is safe to overwrite that location with an
+    empty table, so the uncertain case must never be reported as ``ABSENT``. A
+    missing dataset raises ``ValueError`` from ``lance``; anything else -- a
+    permission fault, an object store that would not answer -- tells us nothing
+    about whether data is there, and guessing wrong destroys a completed write.
+    Failing a genuinely empty write with a clear error is the cheaper mistake.
+    """
+    import lance
+
+    try:
+        lance.dataset(
+            dataset_uri,
+            storage_options=dict(spec.storage_options)
+            if spec.storage_options
+            else None,
+        )
+    except ValueError:
+        return _DatasetState.ABSENT
+    except Exception as error:  # noqa: BLE001 - cannot tell; must not assume
+        logger.debug("Could not determine the state of %s: %s", dataset_uri, error)
+        return _DatasetState.UNKNOWN
+    return _DatasetState.PRESENT
 
 
 def _dataset_version(dataset_uri: str, spec: LanceDBConnectionSpec) -> Optional[int]:
@@ -650,4 +789,44 @@ def _finish_empty_overwrite(
         "table rather than leaving its previous contents in place.",
         table,
     )
+    # ``create_table`` is safe here in a way it is not for an empty *create*:
+    # overwriting an existing dataset makes a new version of it, so the
+    # manifest's ``enable_stable_row_ids`` and file format version carry over
+    # (verified). A create has no manifest to inherit from, which is why that
+    # path writes through lance directly instead.
     connect(spec).create_table(table, schema=effective_schema, mode="overwrite")
+
+
+def _create_empty_dataset(
+    dataset_uri: str,
+    schema: pa.Schema,
+    spec: LanceDBConnectionSpec,
+    *,
+    data_storage_version: Optional[str],
+    enable_stable_row_ids: bool,
+) -> None:
+    """Materialise a zero-row Lance dataset the database can open.
+
+    Written through ``lance`` rather than ``create_table`` for the sake of the
+    options. ``enable_stable_row_ids`` is fixed when a dataset is created and
+    ``create_table`` has no parameter for it, so routing the empty case through
+    the database would quietly produce a table that can never have stable row
+    IDs -- the exact outcome the option exists to let a caller avoid, and one
+    they would discover only when a later job needed the IDs. Writing Lance
+    files at this URI and letting the database resolve them afterwards is also
+    what the non-empty path already does.
+    """
+    import lance
+
+    lance.write_dataset(
+        pa.Table.from_pylist([], schema=schema),
+        dataset_uri,
+        mode="overwrite",
+        # lance types this as a Literal over the versions it knows today.
+        # Mirroring that set here would reject a version a newer lance accepts,
+        # so pass the string through and let lance reject a bad one -- which it
+        # does, by name.
+        data_storage_version=cast("Any", data_storage_version),
+        enable_stable_row_ids=enable_stable_row_ids,
+        storage_options=dict(spec.storage_options) if spec.storage_options else None,
+    )

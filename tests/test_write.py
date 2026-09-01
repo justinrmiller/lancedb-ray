@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import lance
@@ -18,6 +19,22 @@ def version_count(db_dir: str, name: str = "items") -> int:
     """Number of committed versions of a table's backing Lance dataset."""
     versions = lance.dataset(f"{db_dir}/{name}.lance").versions()  # type: ignore[no-untyped-call]
     return len(versions)
+
+
+def file_versions(db_dir: str, name: str = "items") -> list[tuple[int, int]]:
+    """The Lance file format version of each data file in a table."""
+    ds = lance.dataset(f"{db_dir}/{name}.lance")  # type: ignore[no-untyped-call]
+    versions = []
+    for fragment in ds.get_fragments():
+        # to_json() returns a dict on current lance and a JSON string on older
+        # ones; accept either rather than pinning the test to one.
+        raw = fragment.metadata.to_json()
+        meta = raw if isinstance(raw, dict) else json.loads(raw)
+        for data_file in meta["files"]:
+            versions.append(
+                (data_file["file_major_version"], data_file["file_minor_version"])
+            )
+    return versions
 
 
 def dataset_of(table: pa.Table, blocks: int = 1) -> ray.data.Dataset:
@@ -637,6 +654,109 @@ class TestEmptyOverwrite:
         assert lancedb.connect(db_dir).open_table("items").count_rows() == 100
 
 
+class TestWriteVerification:
+    """The post-write check must never "recover" by destroying a good write.
+
+    An empty input leaves no dataset at all, which is what makes the empty case
+    safe to rebuild from the schema. Any other reason the database cannot
+    resolve the table means the rows are on disk, and overwriting them with an
+    empty table would lose a completed write while reporting success.
+    """
+
+    @staticmethod
+    def _break_open_table(monkeypatch: pytest.MonkeyPatch) -> None:
+        import lancedb_ray.io as io_module
+        from lancedb_ray.connection import connect as real_connect
+
+        class Wrapper:
+            def __init__(self, inner: Any) -> None:
+                self._inner = inner
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._inner, name)
+
+            def open_table(self, name: str, *args: Any, **kwargs: Any) -> Any:
+                raise RuntimeError("transient catalog hiccup")
+
+        monkeypatch.setattr(
+            io_module, "connect", lambda spec: Wrapper(real_connect(spec))
+        )
+
+    def test_a_failed_verification_keeps_the_rows(
+        self, db_dir: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        arrow = make_table(300)
+        self._break_open_table(monkeypatch)
+
+        with pytest.raises(RuntimeError, match="resolution failure"):
+            write_lancedb(
+                dataset_of(arrow),
+                "items",
+                uri=db_dir,
+                mode="create",
+                schema=arrow.schema,
+            )
+
+        monkeypatch.undo()
+        # The write completed; only the check after it failed. Losing the rows
+        # here would be a silent, total data loss for the table.
+        assert lance.dataset(f"{db_dir}/items.lance").count_rows() == 300  # type: ignore[no-untyped-call]
+
+    def test_a_failed_verification_fails_loudly(
+        self, db_dir: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Returning success would let a job believe a table it cannot see."""
+        arrow = make_table(50)
+        self._break_open_table(monkeypatch)
+
+        with pytest.raises(RuntimeError, match="cannot open a table"):
+            write_lancedb(
+                dataset_of(arrow),
+                "items",
+                uri=db_dir,
+                mode="create",
+                schema=arrow.schema,
+            )
+
+
+class TestDatasetState:
+    """The probe that decides whether overwriting a location is safe."""
+
+    def test_absent_when_nothing_was_written(self, db_dir: str) -> None:
+        from lancedb_ray.connection import LanceDBConnectionSpec
+        from lancedb_ray.io import _dataset_state, _DatasetState
+
+        spec = LanceDBConnectionSpec.create(db_dir)
+        assert _dataset_state(f"{db_dir}/nothing.lance", spec) is _DatasetState.ABSENT
+
+    def test_present_when_a_dataset_is_there(self, db_dir: str) -> None:
+        from lancedb_ray.connection import LanceDBConnectionSpec
+        from lancedb_ray.io import _dataset_state, _DatasetState
+
+        write_lancedb(dataset_of(make_table(10)), "items", uri=db_dir, mode="create")
+        spec = LanceDBConnectionSpec.create(db_dir)
+        assert _dataset_state(f"{db_dir}/items.lance", spec) is _DatasetState.PRESENT
+
+    def test_an_unreadable_location_is_unknown_not_absent(
+        self, db_dir: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Uncertainty must never be reported as absent.
+
+        ABSENT is what licenses an overwrite, so a storage layer that will not
+        answer has to fall on the side that preserves data.
+        """
+        import lance
+        from lancedb_ray.connection import LanceDBConnectionSpec
+        from lancedb_ray.io import _dataset_state, _DatasetState
+
+        def refuse(*args: Any, **kwargs: Any) -> Any:
+            raise PermissionError("storage said no")
+
+        monkeypatch.setattr(lance, "dataset", refuse)
+        spec = LanceDBConnectionSpec.create(db_dir)
+        assert _dataset_state(f"{db_dir}/items.lance", spec) is _DatasetState.UNKNOWN
+
+
 class TestEmptyCreate:
     """A create whose input turns out to be empty still owes you a table.
 
@@ -775,3 +895,205 @@ class TestConcurrencyValidation:
         db_dir, _ = seeded_local
         assert read_lancedb("items", uri=db_dir, concurrency=None).count() == 100
         assert read_lancedb("items", uri=db_dir, concurrency=2).count() == 100
+
+
+class TestFragmentWriteOptions:
+    """Options that describe the Lance files a fragment write produces.
+
+    They have no analogue on the table API path, so a write that does not take
+    the fragment path has to refuse them rather than drop them silently.
+    """
+
+    def test_stable_row_ids_reach_the_dataset(self, db_dir: str) -> None:
+        write_lancedb(
+            dataset_of(make_table(100), blocks=4),
+            "items",
+            uri=db_dir,
+            mode="create",
+            enable_stable_row_ids=True,
+        )
+
+        ds = lance.dataset(f"{db_dir}/items.lance")  # type: ignore[no-untyped-call]
+        fragments = ds.get_fragments()
+        # A fragment carries row-ID metadata only when stable IDs are on;
+        # without them this is None and a row's address moves under compaction.
+        assert fragments and all(f.metadata.row_id_meta is not None for f in fragments)
+
+    def test_stable_row_ids_are_off_by_default(self, db_dir: str) -> None:
+        """The default has to be observably off, or the flag proves nothing."""
+        write_lancedb(
+            dataset_of(make_table(100), blocks=4), "items", uri=db_dir, mode="create"
+        )
+
+        ds = lance.dataset(f"{db_dir}/items.lance")  # type: ignore[no-untyped-call]
+        fragments = ds.get_fragments()
+        assert fragments and all(f.metadata.row_id_meta is None for f in fragments)
+
+    def test_data_storage_version_reaches_the_dataset(self, db_dir: str) -> None:
+        write_lancedb(
+            dataset_of(make_table(50)),
+            "items",
+            uri=db_dir,
+            mode="create",
+            data_storage_version="2.1",
+        )
+
+        assert read_lancedb("items", uri=db_dir).count() == 50
+        # Assert the version reached the files. A row count would pass whether
+        # or not the option was wired through, which is how a dropped
+        # pass-through stays invisible.
+        assert file_versions(db_dir) == [(2, 1)]
+
+    def test_a_different_storage_version_is_distinguishable(self, db_dir: str) -> None:
+        """The previous test only means something if the value can differ."""
+        write_lancedb(
+            dataset_of(make_table(50)),
+            "items",
+            uri=db_dir,
+            mode="create",
+            data_storage_version="2.0",
+        )
+        assert file_versions(db_dir) == [(2, 0)]
+
+    def test_default_write_leaves_both_alone(self, db_dir: str) -> None:
+        write_lancedb(dataset_of(make_table(20)), "items", uri=db_dir, mode="create")
+        assert read_lancedb("items", uri=db_dir).count() == 20
+
+    def test_an_empty_input_still_honours_stable_row_ids(self, db_dir: str) -> None:
+        """The empty-input fallback must not quietly drop these.
+
+        An empty input produces no fragments, so the table is materialised from
+        the schema instead. Creating it through the database would lose
+        ``enable_stable_row_ids`` -- and because stable IDs are fixed at
+        creation, every later append to that table would silently lack them
+        with no way back short of a rewrite.
+        """
+        empty = make_table(0)
+        write_lancedb(
+            dataset_of(empty),
+            "items",
+            uri=db_dir,
+            mode="create",
+            schema=empty.schema,
+            enable_stable_row_ids=True,
+        )
+        write_lancedb(dataset_of(make_table(50)), "items", uri=db_dir, mode="append")
+
+        ds = lance.dataset(f"{db_dir}/items.lance")  # type: ignore[no-untyped-call]
+        fragments = ds.get_fragments()
+        assert fragments and all(f.metadata.row_id_meta is not None for f in fragments)
+        assert read_lancedb("items", uri=db_dir).count() == 50
+
+    def test_an_empty_overwrite_keeps_stable_row_ids(self, db_dir: str) -> None:
+        """An empty overwrite drops the rows without dropping the setting.
+
+        Two behaviours meet here: emptying a table whose overwrite matched
+        nothing, and keeping ``enable_stable_row_ids`` across it. Overwriting an
+        existing dataset makes a new version, so the manifest's setting carries
+        over on its own -- this pins that end to end rather than proving any
+        particular implementation of the recovery.
+        """
+        write_lancedb(
+            dataset_of(make_table(100)),
+            "items",
+            uri=db_dir,
+            mode="create",
+            enable_stable_row_ids=True,
+        )
+        empty = make_table(0)
+        write_lancedb(
+            dataset_of(empty),
+            "items",
+            uri=db_dir,
+            mode="overwrite",
+            schema=empty.schema,
+            enable_stable_row_ids=True,
+        )
+        write_lancedb(dataset_of(make_table(30)), "items", uri=db_dir, mode="append")
+
+        ds = lance.dataset(f"{db_dir}/items.lance")  # type: ignore[no-untyped-call]
+        fragments = ds.get_fragments()
+        assert ds.count_rows() == 30, "the empty overwrite should have dropped the rows"
+        assert fragments and all(f.metadata.row_id_meta is not None for f in fragments)
+
+    def test_an_empty_input_still_honours_the_storage_version(
+        self, db_dir: str
+    ) -> None:
+        empty = make_table(0)
+        write_lancedb(
+            dataset_of(empty),
+            "items",
+            uri=db_dir,
+            mode="create",
+            schema=empty.schema,
+            data_storage_version="2.0",
+        )
+        write_lancedb(dataset_of(make_table(10)), "items", uri=db_dir, mode="append")
+
+        assert file_versions(db_dir) == [(2, 0)]
+
+    def test_refused_against_cloud_enterprise(
+        self, remote_uri: str, remote_kwargs: dict[str, Any]
+    ) -> None:
+        with pytest.raises(ValueError, match="enable_stable_row_ids only applies"):
+            write_lancedb(
+                dataset_of(make_table(10)),
+                "items",
+                uri=remote_uri,
+                mode="create",
+                enable_stable_row_ids=True,
+                **remote_kwargs,
+            )
+
+    def test_refused_for_an_upsert(self, db_dir: str) -> None:
+        write_lancedb(dataset_of(make_table(10)), "items", uri=db_dir, mode="create")
+        with pytest.raises(ValueError, match="data_storage_version only applies"):
+            write_lancedb(
+                dataset_of(make_table(10)),
+                "items",
+                uri=db_dir,
+                mode="upsert",
+                on="id",
+                data_storage_version="stable",
+            )
+
+    def test_refused_when_the_api_path_is_forced(self, db_dir: str) -> None:
+        with pytest.raises(ValueError, match="only applies to the local fragment"):
+            write_lancedb(
+                dataset_of(make_table(10)),
+                "items",
+                uri=db_dir,
+                mode="create",
+                local_write_strategy="api",
+                enable_stable_row_ids=True,
+            )
+
+    def test_both_are_named_when_both_are_unusable(self, db_dir: str) -> None:
+        with pytest.raises(ValueError, match="data_storage_version, enable_stable"):
+            write_lancedb(
+                dataset_of(make_table(10)),
+                "items",
+                uri=db_dir,
+                mode="create",
+                local_write_strategy="api",
+                data_storage_version="stable",
+                enable_stable_row_ids=True,
+            )
+
+
+class TestMaxBytesPerRequest:
+    def test_a_byte_ceiling_splits_a_task_into_transactions(self, db_dir: str) -> None:
+        """The byte ceiling has to reach the sink, the same way rows do."""
+        arrow = make_table(400)
+        write_lancedb(
+            dataset_of(arrow),
+            "items",
+            uri=db_dir,
+            mode="create",
+            local_write_strategy="api",
+            max_bytes_per_request=arrow.nbytes // 8,
+        )
+
+        assert read_lancedb("items", uri=db_dir).count() == 400
+        # Creation plus more than one append, because the ceiling split the task.
+        assert version_count(db_dir) > 2

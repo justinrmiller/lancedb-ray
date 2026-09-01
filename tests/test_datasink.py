@@ -172,6 +172,105 @@ class TestBatching:
         assert stats.num_rows == 100
         assert stats.num_batches == 4
 
+    def test_max_bytes_per_request_caps_memory_a_row_count_cannot(
+        self, seeded_spec: LanceDBConnectionSpec
+    ) -> None:
+        """A byte ceiling must split where a row ceiling has nothing to say.
+
+        The rows here are mostly a fixed-size vector, so the row count is a poor
+        proxy for what the worker actually holds -- which is the case this
+        ceiling exists for.
+        """
+        arrow = make_table(100)
+        quarter = arrow.nbytes // 4
+        sink = LanceDBDatasink(seeded_spec, "items", max_bytes_per_request=quarter)
+
+        stats = sink.write(iter([arrow]), ctx=None)  # type: ignore[arg-type]
+
+        assert stats.num_rows == 100
+        assert stats.num_batches >= 4
+
+    def test_a_task_inside_the_byte_budget_stays_one_transaction(
+        self, seeded_spec: LanceDBConnectionSpec
+    ) -> None:
+        arrow = make_table(100)
+        sink = LanceDBDatasink(
+            seeded_spec, "items", max_bytes_per_request=arrow.nbytes * 10
+        )
+
+        stats = sink.write(iter([arrow]), ctx=None)  # type: ignore[arg-type]
+
+        assert stats.num_rows == 100
+        assert stats.num_batches == 1
+
+    def test_both_ceilings_apply_and_the_tighter_one_wins(
+        self, seeded_spec: LanceDBConnectionSpec
+    ) -> None:
+        arrow = make_table(100)
+        sink = LanceDBDatasink(
+            seeded_spec,
+            "items",
+            max_rows_per_request=50,
+            # Far tighter than the row ceiling: ~10 rows' worth.
+            max_bytes_per_request=arrow.nbytes // 10,
+        )
+
+        stats = sink.write(iter([arrow]), ctx=None)  # type: ignore[arg-type]
+
+        assert stats.num_rows == 100
+        assert stats.num_batches >= 10
+
+    def test_a_byte_budget_below_one_row_still_writes_every_row(
+        self, seeded_spec: LanceDBConnectionSpec
+    ) -> None:
+        """A budget no single row fits in must make progress, not stall."""
+        sink = LanceDBDatasink(seeded_spec, "items", max_bytes_per_request=1)
+
+        stats = sink.write(iter([make_table(5)]), ctx=None)  # type: ignore[arg-type]
+
+        assert stats.num_rows == 5
+        assert stats.num_batches == 5
+
+    def test_no_request_exceeds_the_byte_ceiling(
+        self, seeded_spec: LanceDBConnectionSpec, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The ceiling has to bound each request, not merely trigger a flush.
+
+        Closing a chunk only once it is already over lets it reach nearly twice
+        the budget, which is exactly the memory the caller said they lacked.
+        """
+        arrow = make_table(200)
+        budget = arrow.nbytes // 7
+        sizes: list[int] = []
+
+        original = LanceDBDatasink._write_once
+
+        def spy(
+            self: LanceDBDatasink,
+            table: Any,
+            schema: pa.Schema,
+            batches: list[pa.RecordBatch],
+            num_rows: int,
+            stats: WriteStats,
+        ) -> None:
+            sizes.append(sum(b.nbytes for b in batches))
+            original(self, table, schema, batches, num_rows, stats)
+
+        monkeypatch.setattr(LanceDBDatasink, "_write_once", spy)
+        sink = LanceDBDatasink(seeded_spec, "items", max_bytes_per_request=budget)
+
+        stats = sink.write(iter([arrow]), ctx=None)  # type: ignore[arg-type]
+
+        assert stats.num_rows == 200
+        assert sizes, "the write issued no requests"
+        assert max(sizes) <= budget, f"{max(sizes)} exceeds the {budget}-byte ceiling"
+
+    def test_rejects_non_positive_max_bytes_per_request(
+        self, spec: LanceDBConnectionSpec
+    ) -> None:
+        with pytest.raises(ValueError, match="max_bytes_per_request must be positive"):
+            LanceDBDatasink(spec, "items", max_bytes_per_request=0)
+
     def test_a_small_task_still_writes(
         self, seeded_spec: LanceDBConnectionSpec
     ) -> None:
@@ -603,6 +702,43 @@ class TestArrowAlignmentRecovery:
         )
         realigned = _realign(table.to_batches(), table.schema)
         assert pa.Table.from_batches(realigned, schema=table.schema).equals(table)
+
+    def test_realign_keeps_batches_separate(self) -> None:
+        """Realigning must not concatenate the task's batches into one.
+
+        A task holds up to ``rows_per_transaction`` rows, and combining them
+        would push a 32-bit-offset string or binary column past the 2GB its
+        offsets can address -- reachable with image or document payloads. It
+        also means peak extra memory is one batch rather than the whole task.
+        """
+        from lancedb_ray.datasink import _realign
+
+        batches = [make_table(10, start=i * 10).to_batches()[0] for i in range(4)]
+
+        realigned = _realign(batches, batches[0].schema)
+
+        assert len(realigned) == 4
+        assert [b.num_rows for b in realigned] == [10, 10, 10, 10]
+        assert all(b.schema.equals(batches[0].schema) for b in realigned)
+
+    def test_realign_normalises_batches_to_the_declared_schema(self) -> None:
+        """The reader advertises one schema, so every batch has to carry it.
+
+        Blocks arrive from separate sources, and a batch whose schema differs
+        only in field metadata still fails ``RecordBatchReader.from_batches``.
+        """
+        from lancedb_ray.datasink import _realign
+
+        schema = pa.schema([pa.field("id", pa.int64())])
+        tagged = pa.schema([pa.field("id", pa.int64(), metadata={b"k": b"v"})])
+        batch = pa.RecordBatch.from_arrays(
+            [pa.array([1, 2], pa.int64())], schema=tagged
+        )
+
+        realigned = _realign([batch], schema)
+
+        assert realigned[0].schema.equals(schema)
+        pa.RecordBatchReader.from_batches(schema, iter(realigned)).read_all()
 
     def test_an_alignment_failure_is_retried_realigned(
         self, seeded_spec: LanceDBConnectionSpec

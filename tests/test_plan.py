@@ -7,6 +7,7 @@ from lancedb_ray._plan import (
     OffsetRange,
     chunk_offsets,
     plan_offset_shards,
+    rows_within_byte_budget,
     split_arrow_table,
 )
 
@@ -124,6 +125,57 @@ class TestSplitArrowTable:
     def test_rejects_negative_rows(self) -> None:
         with pytest.raises(ValueError, match="must not be negative"):
             split_arrow_table(-1, 10)
+
+
+class TestRowsWithinByteBudget:
+    def test_batch_inside_the_budget_is_not_split(self) -> None:
+        assert rows_within_byte_budget(1000, 500, 1000) == 1000
+
+    def test_batch_exactly_at_the_budget_is_not_split(self) -> None:
+        assert rows_within_byte_budget(100, 1000, 1000) == 100
+
+    def test_oversized_batch_is_cut_to_the_average_row_width(self) -> None:
+        # 1000 rows over 10_000 bytes is 10 bytes a row, so 1000 bytes buys 100.
+        assert rows_within_byte_budget(1000, 10_000, 1000) == 100
+
+    def test_a_row_wider_than_the_budget_still_yields_one(self) -> None:
+        """A budget smaller than a single row must not produce a zero-row slice.
+
+        Zero rows would mean the write makes no progress at all -- worse than
+        overshooting a ceiling that is only an estimate to begin with.
+        """
+        assert rows_within_byte_budget(4, 4_000_000, 10) == 1
+
+    def test_empty_batch(self) -> None:
+        assert rows_within_byte_budget(0, 0, 1000) == 0
+
+    def test_zero_byte_batch_is_never_split(self) -> None:
+        assert rows_within_byte_budget(50, 0, 1000) == 50
+
+    @pytest.mark.parametrize("num_rows", [1, 7, 512, 65_537])
+    @pytest.mark.parametrize("max_bytes", [1, 64, 4096, 1 << 20])
+    def test_result_is_always_a_usable_slice(
+        self, num_rows: int, max_bytes: int
+    ) -> None:
+        nbytes = num_rows * 37
+        rows = rows_within_byte_budget(num_rows, nbytes, max_bytes)
+        assert 1 <= rows <= num_rows
+
+    def test_never_overshoots_the_budget_it_can_honour(self) -> None:
+        """Integer arithmetic must round the slice down, not up."""
+        # 3 rows over 10 bytes is 3.33 bytes a row; a budget of 7 fits 2 rows,
+        # and rounding up to 3 would exceed it.
+        assert rows_within_byte_budget(3, 10, 7) == 2
+
+    def test_rejects_non_positive_budget(self) -> None:
+        with pytest.raises(ValueError, match="max_bytes must be positive"):
+            rows_within_byte_budget(10, 100, 0)
+
+    def test_rejects_negative_inputs(self) -> None:
+        with pytest.raises(ValueError, match="num_rows must not be negative"):
+            rows_within_byte_budget(-1, 100, 10)
+        with pytest.raises(ValueError, match="nbytes must not be negative"):
+            rows_within_byte_budget(10, -1, 10)
 
 
 def test_offset_range_num_rows() -> None:

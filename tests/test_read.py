@@ -223,3 +223,72 @@ class TestAfterDeletions:
 
         ds = read_lancedb("items", uri=backend.uri, **backend.kwargs)
         assert ds.count() == 0
+
+
+class TestScannerOptions:
+    """Tuning that reaches the Lance scanner on a local read.
+
+    Without this the only levers on a local scan are ``columns`` and
+    ``filter``; everything the scanner itself understands is unreachable.
+    """
+
+    def test_scan_batch_size_does_not_change_the_result(self, db_dir: str) -> None:
+        import lancedb
+
+        lancedb.connect(db_dir).create_table("items", data=make_table(300))
+
+        ds = read_lancedb("items", uri=db_dir, scanner_options={"batch_size": 64})
+
+        assert ds.count() == 300
+        assert sorted_ids(ds) == list(range(300))
+
+    def test_with_row_id_adds_the_metadata_column(self, db_dir: str) -> None:
+        """A scanner option that is visible in the output proves it arrived."""
+        import lancedb
+
+        lancedb.connect(db_dir).create_table("items", data=make_table(20))
+
+        ds = read_lancedb("items", uri=db_dir, scanner_options={"with_row_id": True})
+
+        assert "_rowid" in ds.schema().names
+
+    def test_combines_with_projection_and_filter(self, db_dir: str) -> None:
+        import lancedb
+
+        lancedb.connect(db_dir).create_table("items", data=make_table(100))
+
+        ds = read_lancedb(
+            "items",
+            uri=db_dir,
+            columns=["id"],
+            filter="id < 10",
+            scanner_options={"batch_size": 8},
+        )
+
+        assert ds.count() == 10
+        assert set(ds.schema().names) == {"id"}
+
+    def test_rejected_for_a_remote_uri(
+        self, seeded_remote: tuple[str, pa.Table], remote_kwargs: dict[str, object]
+    ) -> None:
+        uri, _ = seeded_remote
+        with pytest.raises(ValueError, match="scanner_options applies to the Lance"):
+            read_lancedb(
+                "items",
+                uri=uri,
+                scanner_options={"batch_size": 64},
+                **remote_kwargs,  # type: ignore[arg-type]
+            )
+
+    def test_an_empty_mapping_is_not_a_rejection(
+        self, seeded_remote: tuple[str, pa.Table], remote_kwargs: dict[str, object]
+    ) -> None:
+        """Passing nothing must behave like passing nothing."""
+        uri, _ = seeded_remote
+        ds = read_lancedb(
+            "items",
+            uri=uri,
+            scanner_options={},
+            **remote_kwargs,  # type: ignore[arg-type]
+        )
+        assert ds.count() == 100
