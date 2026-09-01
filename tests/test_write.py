@@ -984,6 +984,38 @@ class TestFragmentWriteOptions:
         assert fragments and all(f.metadata.row_id_meta is not None for f in fragments)
         assert read_lancedb("items", uri=db_dir).count() == 50
 
+    def test_an_empty_overwrite_keeps_stable_row_ids(self, db_dir: str) -> None:
+        """An empty overwrite drops the rows without dropping the setting.
+
+        Two behaviours meet here: emptying a table whose overwrite matched
+        nothing, and keeping ``enable_stable_row_ids`` across it. Overwriting an
+        existing dataset makes a new version, so the manifest's setting carries
+        over on its own -- this pins that end to end rather than proving any
+        particular implementation of the recovery.
+        """
+        write_lancedb(
+            dataset_of(make_table(100)),
+            "items",
+            uri=db_dir,
+            mode="create",
+            enable_stable_row_ids=True,
+        )
+        empty = make_table(0)
+        write_lancedb(
+            dataset_of(empty),
+            "items",
+            uri=db_dir,
+            mode="overwrite",
+            schema=empty.schema,
+            enable_stable_row_ids=True,
+        )
+        write_lancedb(dataset_of(make_table(30)), "items", uri=db_dir, mode="append")
+
+        ds = lance.dataset(f"{db_dir}/items.lance")  # type: ignore[no-untyped-call]
+        fragments = ds.get_fragments()
+        assert ds.count_rows() == 30, "the empty overwrite should have dropped the rows"
+        assert fragments and all(f.metadata.row_id_meta is not None for f in fragments)
+
     def test_an_empty_input_still_honours_the_storage_version(
         self, db_dir: str
     ) -> None:
