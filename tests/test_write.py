@@ -544,6 +544,99 @@ class TestFragmentWriteVerification:
             )
 
 
+class TestEmptyOverwrite:
+    """An overwrite that matched no rows must still empty the table.
+
+    ``write_lance`` commits nothing for a zero-row input, so without help the
+    local path leaves every previous row in place and reports success -- while
+    Cloud/Enterprise, which replaces the table up front, empties it. The two
+    backends have to agree, and they have to agree on the answer that does not
+    silently republish stale data.
+    """
+
+    def test_an_empty_overwrite_empties_the_table(self, backend: Backend) -> None:
+        backend.create("items", make_table(100))
+        empty = make_table(0)
+
+        write_lancedb(
+            dataset_of(empty),
+            "items",
+            uri=backend.uri,
+            mode="overwrite",
+            schema=empty.schema,
+            **backend.kwargs,
+        )
+
+        assert backend.count("items") == 0
+
+    def test_an_empty_overwrite_without_a_schema_keeps_the_shape(
+        self, db_dir: str
+    ) -> None:
+        """Dropping the rows is not a request to reshape the table."""
+        import lancedb
+
+        original = make_table(100)
+        lancedb.connect(db_dir).create_table("items", data=original)
+
+        write_lancedb(dataset_of(make_table(0)), "items", uri=db_dir, mode="overwrite")
+
+        table = lancedb.connect(db_dir).open_table("items")
+        assert table.count_rows() == 0
+        assert set(table.schema.names) == set(original.schema.names)
+
+    def test_an_empty_append_is_still_a_no_op(self, backend: Backend) -> None:
+        """Only overwrite means "replace the contents"; append must not."""
+        backend.create("items", make_table(10))
+
+        write_lancedb(
+            dataset_of(make_table(0)),
+            "items",
+            uri=backend.uri,
+            mode="append",
+            **backend.kwargs,
+        )
+
+        assert backend.count("items") == 10
+
+    def test_a_non_empty_overwrite_still_replaces(self, backend: Backend) -> None:
+        backend.create("items", make_table(500))
+
+        write_lancedb(
+            dataset_of(make_table(20)),
+            "items",
+            uri=backend.uri,
+            mode="overwrite",
+            **backend.kwargs,
+        )
+
+        assert backend.count("items") == 20
+
+    def test_an_unreadable_version_leaves_the_table_alone(
+        self, db_dir: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Uncertainty must not license deleting rows.
+
+        The empty-overwrite recovery replaces a table's contents, so it may only
+        run when both version probes actually answered. If either did not, the
+        old rows stay and the caller is warned.
+        """
+        import lancedb
+        import lancedb_ray.io as io_module
+
+        lancedb.connect(db_dir).create_table("items", data=make_table(100))
+        monkeypatch.setattr(io_module, "_dataset_version", lambda *a, **k: None)
+
+        write_lancedb(
+            dataset_of(make_table(0)),
+            "items",
+            uri=db_dir,
+            mode="overwrite",
+            schema=make_table(0).schema,
+        )
+
+        assert lancedb.connect(db_dir).open_table("items").count_rows() == 100
+
+
 class TestEmptyCreate:
     """A create whose input turns out to be empty still owes you a table.
 
