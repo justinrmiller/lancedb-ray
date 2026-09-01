@@ -352,10 +352,17 @@ def write_lancedb(
             know the keys are unique and want to skip the shuffle.
         schema: Schema used when creating the table. Defaults to the dataset's.
         transform_fn: Optional per-batch transform applied before writing.
-            Only supported on the API write path; requesting it for a local
-            append switches that write to the API path.
-        min_rows_per_write: Rows accumulated per request on the API path.
-        max_rows_per_request: Ceiling on rows in a single request.
+            On the API path the sink applies it per batch; on the fragment path
+            it runs as its own Ray stage beforehand, so the write itself still
+            commits once. Note it runs *after* ``partition_on_keys`` has
+            shuffled, so a transform that rewrites a key column undoes that
+            co-location.
+        rows_per_transaction: Rows Ray bundles into each write task, which is
+            what sets the transaction size and the task's peak memory.
+        max_rows_per_request: Ceiling on rows in a single request; larger
+            accumulations are split across several. Setting either per-request
+            ceiling means a task no longer writes in one transaction, so a
+            failure partway can leave earlier chunks committed.
         max_bytes_per_request: Ceiling on the size of a single request's
             payload, on the API path. Rows are a poor proxy for size once a
             schema is wide -- 256K rows of a 1536-dimension float32 embedding is
@@ -388,7 +395,8 @@ def write_lancedb(
             fixed when the dataset is created -- a table written without it
             cannot be switched later without a rewrite -- so it is worth
             deciding at creation rather than discovering afterwards.
-        retry_policy: Retry behaviour for failed batches on the API path.
+        write_parallelism: How many parts the client uploads concurrently
+            within one transaction, on the API path.
         ray_remote_args: Resource arguments for the write tasks.
         concurrency: Maximum number of concurrent write tasks. Local upserts
             default to 4 because concurrent merge-insert contends on the

@@ -196,7 +196,8 @@ class LanceDBDatasink(Datasink[WriteStats]):
         on: Key column(s) to match on. Required when ``mode="upsert"``.
         schema: Arrow schema for table creation. Defaults to the schema Ray
             reports for the first input bundle.
-        min_rows_per_write: Rows accumulated before a request is issued.
+        rows_per_transaction: Rows Ray bundles into each write task, which is
+            what sets the transaction size and the task's peak memory.
         max_rows_per_request: Ceiling on rows in a single request; larger
             accumulations are split.
         max_bytes_per_request: Ceiling on the size of a single request's
@@ -216,6 +217,8 @@ class LanceDBDatasink(Datasink[WriteStats]):
         on_batch_error: ``raise`` (default) fails the job; ``skip`` logs and
             drops the batch. The default is deliberate -- silently dropping
             batches lets a write report success while having lost data.
+        write_parallelism: How many parts the client uploads concurrently
+            within one transaction.
         retry_policy: Retry behaviour for failed batches.
     """
 
@@ -335,7 +338,7 @@ class LanceDBDatasink(Datasink[WriteStats]):
             )
 
     def write(self, blocks: Iterable[Block], ctx: TaskContext) -> WriteStats:
-        """Write one task's blocks as a **single** LanceDB transaction.
+        """Write one task's blocks as a single LanceDB transaction by default.
 
         Each transaction produces a new table version and at least one fragment,
         so issuing one per incoming batch would leave a table with thousands of
@@ -343,6 +346,10 @@ class LanceDBDatasink(Datasink[WriteStats]):
         rows are instead handed to LanceDB as one ``RecordBatchReader``: the
         client streams that to the service as multiple parts under a single
         upload, committing once.
+
+        Setting ``max_rows_per_request`` or ``max_bytes_per_request`` trades
+        that away: the task then commits one transaction per chunk, so a
+        failure partway leaves the earlier chunks committed.
 
         Blocks are retained as Arrow batches rather than concatenated so the
         reader can be rebuilt for a retry (a reader is single-use) without
