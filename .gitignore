@@ -224,3 +224,6 @@ __marimo__/
 uv.lock
 .ruff_cache/
 *.lance/
+
+# Benchmark results (regenerated per run; baselines are committed separately)
+benchmarks/results/
