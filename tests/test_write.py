@@ -654,6 +654,109 @@ class TestEmptyOverwrite:
         assert lancedb.connect(db_dir).open_table("items").count_rows() == 100
 
 
+class TestWriteVerification:
+    """The post-write check must never "recover" by destroying a good write.
+
+    An empty input leaves no dataset at all, which is what makes the empty case
+    safe to rebuild from the schema. Any other reason the database cannot
+    resolve the table means the rows are on disk, and overwriting them with an
+    empty table would lose a completed write while reporting success.
+    """
+
+    @staticmethod
+    def _break_open_table(monkeypatch: pytest.MonkeyPatch) -> None:
+        import lancedb_ray.io as io_module
+        from lancedb_ray.connection import connect as real_connect
+
+        class Wrapper:
+            def __init__(self, inner: Any) -> None:
+                self._inner = inner
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._inner, name)
+
+            def open_table(self, name: str, *args: Any, **kwargs: Any) -> Any:
+                raise RuntimeError("transient catalog hiccup")
+
+        monkeypatch.setattr(
+            io_module, "connect", lambda spec: Wrapper(real_connect(spec))
+        )
+
+    def test_a_failed_verification_keeps_the_rows(
+        self, db_dir: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        arrow = make_table(300)
+        self._break_open_table(monkeypatch)
+
+        with pytest.raises(RuntimeError, match="resolution failure"):
+            write_lancedb(
+                dataset_of(arrow),
+                "items",
+                uri=db_dir,
+                mode="create",
+                schema=arrow.schema,
+            )
+
+        monkeypatch.undo()
+        # The write completed; only the check after it failed. Losing the rows
+        # here would be a silent, total data loss for the table.
+        assert lance.dataset(f"{db_dir}/items.lance").count_rows() == 300  # type: ignore[no-untyped-call]
+
+    def test_a_failed_verification_fails_loudly(
+        self, db_dir: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Returning success would let a job believe a table it cannot see."""
+        arrow = make_table(50)
+        self._break_open_table(monkeypatch)
+
+        with pytest.raises(RuntimeError, match="cannot open a table"):
+            write_lancedb(
+                dataset_of(arrow),
+                "items",
+                uri=db_dir,
+                mode="create",
+                schema=arrow.schema,
+            )
+
+
+class TestDatasetState:
+    """The probe that decides whether overwriting a location is safe."""
+
+    def test_absent_when_nothing_was_written(self, db_dir: str) -> None:
+        from lancedb_ray.connection import LanceDBConnectionSpec
+        from lancedb_ray.io import _dataset_state, _DatasetState
+
+        spec = LanceDBConnectionSpec.create(db_dir)
+        assert _dataset_state(f"{db_dir}/nothing.lance", spec) is _DatasetState.ABSENT
+
+    def test_present_when_a_dataset_is_there(self, db_dir: str) -> None:
+        from lancedb_ray.connection import LanceDBConnectionSpec
+        from lancedb_ray.io import _dataset_state, _DatasetState
+
+        write_lancedb(dataset_of(make_table(10)), "items", uri=db_dir, mode="create")
+        spec = LanceDBConnectionSpec.create(db_dir)
+        assert _dataset_state(f"{db_dir}/items.lance", spec) is _DatasetState.PRESENT
+
+    def test_an_unreadable_location_is_unknown_not_absent(
+        self, db_dir: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Uncertainty must never be reported as absent.
+
+        ABSENT is what licenses an overwrite, so a storage layer that will not
+        answer has to fall on the side that preserves data.
+        """
+        import lance
+        from lancedb_ray.connection import LanceDBConnectionSpec
+        from lancedb_ray.io import _dataset_state, _DatasetState
+
+        def refuse(*args: Any, **kwargs: Any) -> Any:
+            raise PermissionError("storage said no")
+
+        monkeypatch.setattr(lance, "dataset", refuse)
+        spec = LanceDBConnectionSpec.create(db_dir)
+        assert _dataset_state(f"{db_dir}/items.lance", spec) is _DatasetState.UNKNOWN
+
+
 class TestEmptyCreate:
     """A create whose input turns out to be empty still owes you a table.
 

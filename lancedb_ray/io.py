@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping
+from enum import Enum
 from typing import Any, Literal, Optional, Union, cast
 
 import pyarrow as pa
@@ -44,6 +45,17 @@ LocalWriteStrategy = Literal["auto", "fragment", "api"]
 
 #: Block count used to hash-partition an upsert when nothing better is known.
 _DEFAULT_UPSERT_PARTITIONS = 16
+
+
+class _DatasetState(Enum):
+    """What we could establish about a dataset URI after a write."""
+
+    #: Nothing is there -- the write produced no fragments, so the input was empty.
+    ABSENT = "absent"
+    #: A dataset opened; it holds the rows that were written.
+    PRESENT = "present"
+    #: Storage could not answer. Treated as PRESENT would be, never as ABSENT.
+    UNKNOWN = "unknown"
 
 
 def _build_spec(
@@ -634,25 +646,72 @@ def _write_local_fragments(
     except Exception as error:  # noqa: BLE001 - one recoverable case below
         resolve_error = error
 
-    # A dataset with no rows produces no fragments, and therefore no manifest
-    # for the database to open. Asking to create a table from an empty input is
-    # a reasonable thing to do -- a job whose filter matched nothing still wants
-    # its table -- so materialise it from the schema instead of failing.
-    if schema is not None:
-        _create_empty_dataset(
-            dataset_uri,
-            schema,
-            spec,
-            data_storage_version=data_storage_version,
-            enable_stable_row_ids=enable_stable_row_ids,
-        )
-        return
+    # Exactly one failure here is recoverable: an input with no rows produces
+    # no fragments and so no dataset at all, leaving nothing for the database
+    # to open. Every other cause -- a transient catalog error, a permission
+    # fault, a race -- means the rows *are* on disk, and recovering by writing
+    # an empty dataset over them would destroy a completed write and report
+    # success. So establish which case this is before assuming.
+    if _dataset_state(dataset_uri, spec) is not _DatasetState.ABSENT:
+        raise RuntimeError(
+            f"Wrote a Lance dataset to {dataset_uri!r} but database "
+            f"{spec.uri!r} cannot open a table named {table!r}. The data is "
+            "there -- this is a resolution failure, not an empty write, so it "
+            "is left untouched rather than replaced with an empty table."
+        ) from resolve_error
 
-    raise RuntimeError(
-        f"Wrote a Lance dataset to {dataset_uri!r} but database {spec.uri!r} "
-        f"cannot open a table named {table!r}. If the input was empty, pass "
-        "schema=... so the table can be created from it."
-    ) from resolve_error
+    # A job whose filter matched nothing still wants its table, so materialise
+    # it from the schema rather than failing.
+    if schema is None:
+        raise RuntimeError(
+            f"Wrote a Lance dataset to {dataset_uri!r} but database {spec.uri!r} "
+            f"cannot open a table named {table!r}. If the input was empty, pass "
+            "schema=... so the table can be created from it."
+        ) from resolve_error
+
+    _create_empty_dataset(
+        dataset_uri,
+        schema,
+        spec,
+        data_storage_version=data_storage_version,
+        enable_stable_row_ids=enable_stable_row_ids,
+    )
+    # Writing the files is not the same as the database being able to resolve
+    # them. Confirm rather than return an unverified success.
+    try:
+        connect(spec).open_table(table)
+    except Exception as error:
+        raise RuntimeError(
+            f"Created an empty Lance dataset at {dataset_uri!r} but database "
+            f"{spec.uri!r} still cannot open a table named {table!r}."
+        ) from error
+
+
+def _dataset_state(dataset_uri: str, spec: LanceDBConnectionSpec) -> _DatasetState:
+    """Establish whether a Lance dataset was materialised at ``dataset_uri``.
+
+    The answer decides whether it is safe to overwrite that location with an
+    empty table, so the uncertain case must never be reported as ``ABSENT``. A
+    missing dataset raises ``ValueError`` from ``lance``; anything else -- a
+    permission fault, an object store that would not answer -- tells us nothing
+    about whether data is there, and guessing wrong destroys a completed write.
+    Failing a genuinely empty write with a clear error is the cheaper mistake.
+    """
+    import lance
+
+    try:
+        lance.dataset(
+            dataset_uri,
+            storage_options=dict(spec.storage_options)
+            if spec.storage_options
+            else None,
+        )
+    except ValueError:
+        return _DatasetState.ABSENT
+    except Exception as error:  # noqa: BLE001 - cannot tell; must not assume
+        logger.debug("Could not determine the state of %s: %s", dataset_uri, error)
+        return _DatasetState.UNKNOWN
+    return _DatasetState.PRESENT
 
 
 def _dataset_version(dataset_uri: str, spec: LanceDBConnectionSpec) -> Optional[int]:
