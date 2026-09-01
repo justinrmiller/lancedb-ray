@@ -665,17 +665,21 @@ def _write_local_fragments(
         ) from resolve_error
 
     # A job whose filter matched nothing still wants its table, so materialise
-    # it from the schema rather than failing.
-    if schema is None:
+    # it from the schema rather than failing. Ray knows the input's schema even
+    # when the input has no rows, and the table API path already creates the
+    # table from it -- so the two paths agreed on everything except this, where
+    # the default local path was the one that failed.
+    effective_schema = schema if schema is not None else _arrow_schema(ds)
+    if effective_schema is None:
         raise RuntimeError(
             f"Wrote a Lance dataset to {dataset_uri!r} but database {spec.uri!r} "
-            f"cannot open a table named {table!r}. If the input was empty, pass "
-            "schema=... so the table can be created from it."
+            f"cannot open a table named {table!r}. The input was empty and Ray "
+            "reported no schema for it, so pass schema=... to create the table."
         ) from resolve_error
 
     _create_empty_dataset(
         dataset_uri,
-        schema,
+        effective_schema,
         spec,
         data_storage_version=data_storage_version,
         enable_stable_row_ids=enable_stable_row_ids,
@@ -689,6 +693,23 @@ def _write_local_fragments(
             f"Created an empty Lance dataset at {dataset_uri!r} but database "
             f"{spec.uri!r} still cannot open a table named {table!r}."
         ) from error
+
+
+def _arrow_schema(ds: Dataset) -> Optional[pa.Schema]:
+    """The dataset's own Arrow schema, or ``None`` if Ray cannot report one.
+
+    Only called on the recovery path, where the write produced no fragments and
+    the input was therefore empty -- so ``fetch_if_missing`` re-executes an
+    empty plan rather than real work. ``Dataset.schema`` returns Ray's wrapper,
+    which carries the Arrow schema underneath.
+    """
+    try:
+        reported = ds.schema(fetch_if_missing=True)
+    except Exception as error:  # noqa: BLE001 - a missing schema is not fatal
+        logger.debug("Could not resolve the dataset schema: %s", error)
+        return None
+    base = getattr(reported, "base_schema", reported)
+    return base if isinstance(base, pa.Schema) else None
 
 
 def _dataset_state(dataset_uri: str, spec: LanceDBConnectionSpec) -> _DatasetState:

@@ -791,20 +791,53 @@ class TestEmptyCreate:
 
         assert lancedb.connect(db_dir).open_table("items").count_rows() == 25
 
-    def test_without_a_schema_the_failure_is_explained(self, db_dir: str) -> None:
-        import lance_ray
+    def test_empty_create_without_a_schema_uses_the_dataset_schema(
+        self, db_dir: str
+    ) -> None:
+        """The default local path must not need a schema Ray already knows.
 
-        # Simulate a write that produces nothing resolvable and no schema to
-        # rebuild from: the error should say what to pass.
-        original = lance_ray.write_lance
-        try:
-            lance_ray.write_lance = lambda *a, **k: None  # type: ignore[assignment]
-            with pytest.raises(RuntimeError, match="schema="):
-                write_lancedb(
-                    dataset_of(make_table(5)), "items", uri=db_dir, mode="create"
-                )
-        finally:
-            lance_ray.write_lance = original  # type: ignore[assignment]
+        The table API path creates the table from the input's schema, so the
+        fragment path failing here made the same call succeed or fail purely on
+        which strategy it happened to take.
+        """
+        import lancedb
+
+        source = make_table(0)
+        write_lancedb(dataset_of(source), "items", uri=db_dir, mode="create")
+
+        table = lancedb.connect(db_dir).open_table("items")
+        assert table.count_rows() == 0
+        assert set(table.schema.names) == set(source.schema.names)
+
+    def test_both_write_paths_agree_on_an_empty_create(self, db_dir: str) -> None:
+        import lancedb
+
+        for strategy, name in (("fragment", "frag"), ("api", "api")):
+            write_lancedb(
+                dataset_of(make_table(0)),
+                name,
+                uri=db_dir,
+                mode="create",
+                local_write_strategy=strategy,  # type: ignore[arg-type]
+            )
+        db = lancedb.connect(db_dir)
+        assert db.open_table("frag").count_rows() == 0
+        assert set(db.open_table("frag").schema.names) == set(
+            db.open_table("api").schema.names
+        )
+
+    def test_without_any_schema_the_failure_is_explained(
+        self, db_dir: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import lance_ray
+        from lancedb_ray import io as io_module
+
+        # Simulate a write that produces nothing resolvable *and* a dataset Ray
+        # cannot report a schema for: the error should say what to pass.
+        monkeypatch.setattr(lance_ray, "write_lance", lambda *a, **k: None)
+        monkeypatch.setattr(io_module, "_arrow_schema", lambda ds: None)
+        with pytest.raises(RuntimeError, match="schema="):
+            write_lancedb(dataset_of(make_table(5)), "items", uri=db_dir, mode="create")
 
 
 class TestFailedWriteAtomicity:
