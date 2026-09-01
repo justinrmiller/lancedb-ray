@@ -10,6 +10,12 @@ help:
 	@echo "  lint        Run ruff check, ruff format --check and mypy"
 	@echo "  fix         Auto-fix lint issues and format code"
 	@echo "  example     Run the end-to-end quickstart example"
+	@echo "  benchmark   Run the benchmark suite (TIER=smoke|ci|local|full)"
+	@echo "  benchmark-compare   Run and diff against the committed baseline"
+	@echo "  benchmark-baseline  Rewrite the baseline for this tier (deliberate)"
+	@echo "  benchmark-enterprise Run the opt-in live Enterprise target"
+	@echo "  benchmark-s3         Run the opt-in object-storage target"
+	@echo "  benchmark-clean      Remove stray benchmark run directories"
 	@echo "  clean       Remove build artifacts and caches"
 
 .PHONY: build
@@ -43,6 +49,42 @@ fix:
 example:
 	uv run python examples/quickstart.py
 
+# Tier sizes the run; every correctness check runs in every tier. ARGS is
+# passed through, e.g. ARGS="--scenario read --repeat 5".
+TIER ?= local
+ARGS ?=
+BASELINE = benchmarks/baselines/ci-ubuntu-latest.json
+
+.PHONY: benchmark
+benchmark:
+	uv run python -m benchmarks --tier $(TIER) $(ARGS)
+
+.PHONY: benchmark-compare
+benchmark-compare:
+	uv run python -m benchmarks --tier $(TIER) --compare $(BASELINE) $(ARGS)
+
+.PHONY: benchmark-baseline
+benchmark-baseline:
+	uv run python -m benchmarks --tier $(TIER) --write-baseline $(BASELINE) $(ARGS)
+
+# Creates uniquely named tables and drops them, including any left by a run
+# that was killed. Needs LANCEDB_URI and LANCEDB_API_KEY.
+.PHONY: benchmark-enterprise
+benchmark-enterprise:
+	uv run python -m benchmarks --tier $(TIER) --backend enterprise $(ARGS)
+
+# Needs BENCH_S3_URI (and BENCH_S3_ENDPOINT for an emulator); see
+# examples/object_storage for a compose file that provides one.
+.PHONY: benchmark-s3
+benchmark-s3:
+	uv run python -m benchmarks --tier $(TIER) --backend s3 $(ARGS)
+
+.PHONY: benchmark-clean
+benchmark-clean:
+	rm -rf benchmarks/results
+	rm -rf /tmp/ldbrbench_* $${BENCH_RUN_ROOT:-/nonexistent}/run_*
+	@echo "removed benchmark run directories and results"
+
 .PHONY: clean
 clean:
 	rm -rf build/ dist/ *.egg-info/
@@ -52,3 +94,5 @@ clean:
 	find . -type d -name .mypy_cache -exec rm -rf {} +
 	rm -f .coverage .coverage.* coverage.xml
 	find . -type d -name htmlcov -exec rm -rf {} +
+	rm -rf benchmarks/results
+	rm -rf /tmp/ldbrbench_*

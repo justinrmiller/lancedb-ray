@@ -52,7 +52,7 @@ include = ["lancedb_ray*"]
 [tool.ruff]
 line-length = 88
 target-version = "py312"
-src = ["lancedb_ray", "tests", "examples"]
+src = ["lancedb_ray", "tests", "examples", "benchmarks"]
 
 [tool.ruff.lint]
 select = ["E", "W", "F", "I", "B", "UP", "SIM"]
@@ -81,7 +81,9 @@ markers = [
 
 [tool.coverage.run]
 source = ["lancedb_ray"]
-omit = ["*/tests/*"]
+# The benchmark suite is tooling, exercised by being run rather than by the
+# unit tests, so it is not part of the coverage gate.
+omit = ["*/tests/*", "*/benchmarks/*"]
 # Line coverage alone hides half-tested conditionals: a branch whose true arm
 # runs and whose false arm never does still counts every line as covered.
 branch = true
@@ -90,16 +92,26 @@ branch = true
 # No python_version pin: it must match the interpreter actually running mypy,
 # because some installed stubs (numpy) use syntax newer than our floor.
 # Ruff's target-version = "py312" is what enforces the language floor.
-files = ["lancedb_ray", "tests", "examples"]
+files = ["lancedb_ray", "tests", "examples", "benchmarks"]
 # Test helpers and example modules are imported flat (not as tests.* or
 # examples.*) because Ray workers load them that way, so mypy needs the same
 # search path. Example module names are kept globally unique to match.
+# ``benchmarks`` reuses the test suite's fake Cloud/Enterprise backend, which is
+# imported flat (``_fakes``) because Ray workers load it that way.
 mypy_path = ["tests", "examples/clip_image_search", "examples/vllm_generate_embed"]
 strict = true
 warn_unused_ignores = false
 
 [[tool.mypy.overrides]]
-module = ["lancedb.*", "lance.*", "lance_ray.*", "ray.*", "pyarrow.*", "pandas.*"]
+module = [
+    "lancedb.*",
+    "lance.*",
+    "lance_ray.*",
+    "ray.*",
+    "pyarrow.*",
+    "pandas.*",
+    "psutil.*",
+]
 ignore_missing_imports = true
 
 # The clip_image_search example's dependencies are deliberately not part of
