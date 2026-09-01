@@ -294,6 +294,44 @@ class TestSingleStrategyExecution:
         source = LanceDBDatasource(spec, "items", strategy="single")
         (task,) = source.get_read_tasks(1, per_task_row_limit=10)
         assert (task.metadata.num_rows or 0) == 10
+        # Asserting the metadata alone let the task stream the whole table
+        # while claiming it had produced ten rows.
+        assert sum(block.num_rows for block in task()) == 10
+
+    def test_single_task_limit_is_pushed_into_the_query(
+        self, spec: LanceDBConnectionSpec
+    ) -> None:
+        """The limit must shrink the read, not just trim what comes back."""
+        source = LanceDBDatasource(spec, "items", strategy="single", batch_size=5)
+        (task,) = source.get_read_tasks(1, per_task_row_limit=7)
+        rows = sum(block.num_rows for block in task())
+        assert rows == 7
+
+    def test_single_task_without_a_limit_still_streams_everything(
+        self, spec: LanceDBConnectionSpec
+    ) -> None:
+        source = LanceDBDatasource(spec, "items", strategy="single")
+        (task,) = source.get_read_tasks(1)
+        assert sum(block.num_rows for block in task()) == 100
+
+    @pytest.mark.parametrize("strategy", ["offsets", "pagination", "single"])
+    def test_read_tasks_carry_the_limit_for_ray_to_enforce(
+        self, spec: LanceDBConnectionSpec, strategy: str
+    ) -> None:
+        source = LanceDBDatasource(spec, "items", strategy=strategy)  # type: ignore[arg-type]
+        tasks = source.get_read_tasks(3, per_task_row_limit=4)
+        assert tasks
+        assert all(t.per_task_row_limit == 4 for t in tasks)
+        assert all(sum(b.num_rows for b in t()) <= 4 for t in tasks)
+
+    @pytest.mark.parametrize("strategy", ["offsets", "pagination", "single"])
+    def test_no_limit_leaves_the_read_task_unbounded(
+        self, spec: LanceDBConnectionSpec, strategy: str
+    ) -> None:
+        source = LanceDBDatasource(spec, "items", strategy=strategy)  # type: ignore[arg-type]
+        assert all(
+            t.per_task_row_limit is None for t in source.get_read_tasks(3)
+        )
 
 
 class TestPaginationEdgeCases:

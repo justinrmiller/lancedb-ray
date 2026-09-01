@@ -67,6 +67,23 @@ def _build_block_metadata(
     )
 
 
+def _build_read_task(
+    read_fn: Any, metadata: BlockMetadata, row_limit: Optional[int]
+) -> ReadTask:
+    """Construct a ``ReadTask``, passing the row limit where Ray accepts it.
+
+    Ray slices a task's blocks down to ``per_task_row_limit`` itself, which is
+    what makes the limit a guarantee rather than a promise each strategy has to
+    remember to keep. Probed rather than version-pinned, like
+    :func:`_build_block_metadata`.
+    """
+    if row_limit is None:
+        return ReadTask(read_fn, metadata)
+    if "per_task_row_limit" in inspect.signature(ReadTask.__init__).parameters:
+        return ReadTask(read_fn, metadata, per_task_row_limit=row_limit)
+    return ReadTask(read_fn, metadata)
+
+
 def validate_columns(columns: Optional[list[str]]) -> None:
     """Reject a projection that names no columns.
 
@@ -188,11 +205,17 @@ def _read_single(
     batch_size: int,
     retry_policy: RetryPolicy,
     schema: Optional[pa.Schema],
+    row_limit: Optional[int] = None,
 ) -> Iterator[pa.Table]:
     """Stream the whole table through a single task.
 
     The escape hatch for cases where sharding is undesirable -- notably a
     highly selective filter, where paging costs more than a single scan.
+
+    ``row_limit`` is pushed into the query rather than left to Ray to trim
+    afterwards: the sharded strategies express a downstream ``limit`` by
+    shrinking their offset range, and a single task that streamed the whole
+    table regardless would read the entire table to answer a ``.limit(10)``.
     """
     table = open_table(spec, table_name, version=version)
 
@@ -200,7 +223,10 @@ def _read_single(
         query = table.search(None)
         if filter_:
             query = query.where(filter_)
-        return _apply_columns(query, columns).to_batches(batch_size)
+        query = _apply_columns(query, columns)
+        if row_limit is not None:
+            query = query.limit(row_limit)
+        return query.to_batches(batch_size)
 
     batches = call_with_retry(
         fetch, retry_policy, description=f"streaming read of {table_name}"
@@ -348,13 +374,20 @@ class LanceDBDatasource(Datasource):
                 self._batch_size,
                 self._retry_policy,
                 self._schema,
+                per_task_row_limit,
             )
             rows = (
                 self._num_rows
                 if per_task_row_limit is None
                 else min(self._num_rows, per_task_row_limit)
             )
-            return [ReadTask(read_fn, _build_block_metadata(rows, self._schema))]
+            return [
+                _build_read_task(
+                    read_fn,
+                    _build_block_metadata(rows, self._schema),
+                    per_task_row_limit,
+                )
+            ]
 
         shards = plan_offset_shards(self._num_rows, parallelism)
         if per_task_row_limit is not None:
@@ -392,6 +425,10 @@ class LanceDBDatasource(Datasource):
                     self._schema,
                 )
             read_tasks.append(
-                ReadTask(read_fn, _build_block_metadata(shard.num_rows, self._schema))
+                _build_read_task(
+                    read_fn,
+                    _build_block_metadata(shard.num_rows, self._schema),
+                    per_task_row_limit,
+                )
             )
         return read_tasks
