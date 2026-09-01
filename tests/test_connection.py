@@ -38,6 +38,41 @@ class TestBackendDetection:
             LanceDBConnectionSpec.create("")
 
 
+class TestConnectionCacheBounds:
+    def test_the_connection_cache_is_bounded(self) -> None:
+        """An unbounded cache leaks a live client per credential ever seen.
+
+        The key includes the resolved API key, so a worker whose credentials
+        rotate would otherwise hold every past connection open for the life of
+        the process.
+        """
+        from lancedb_ray.connection import _connect_cached
+
+        info = _connect_cached.cache_info()
+        assert info.maxsize is not None
+        assert info.maxsize >= 2
+
+    def test_many_distinct_specs_do_not_grow_without_limit(
+        self, db_dir: str
+    ) -> None:
+        from lancedb_ray.connection import (
+            _CONNECTION_CACHE_SIZE,
+            _connect_cached,
+            connect,
+        )
+
+        for i in range(_CONNECTION_CACHE_SIZE * 2):
+            connect(LanceDBConnectionSpec.create(db_dir, region=f"r-{i}"))
+
+        assert _connect_cached.cache_info().currsize <= _CONNECTION_CACHE_SIZE
+
+    def test_a_repeated_spec_still_reuses_one_connection(self, db_dir: str) -> None:
+        from lancedb_ray.connection import connect
+
+        spec = LanceDBConnectionSpec.create(db_dir)
+        assert connect(spec) is connect(spec)
+
+
 class TestSpecHashing:
     def test_specs_with_equal_mappings_are_equal(self) -> None:
         a = LanceDBConnectionSpec.create("/db", storage_options={"region": "us-west-2"})
