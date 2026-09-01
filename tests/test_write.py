@@ -917,6 +917,58 @@ class TestEmptyCreate:
             )
 
 
+class TestRecoveryProbes:
+    """The recovery path's probes must answer "cannot tell", never guess.
+
+    Both feed the decision to stand an empty table at a URI, so a probe that
+    reported a confident wrong answer would do it over a completed write.
+    """
+
+    def test_an_unreadable_schema_reports_cannot_tell(self) -> None:
+        from lancedb_ray.io import _arrow_schema
+
+        class Broken:
+            def schema(self, fetch_if_missing: bool = False) -> Any:
+                raise RuntimeError("plan could not be executed")
+
+        assert _arrow_schema(Broken()) is None  # type: ignore[arg-type]
+
+    def test_a_non_arrow_schema_reports_cannot_tell(self) -> None:
+        from lancedb_ray.io import _arrow_schema
+
+        class Simple:
+            def schema(self, fetch_if_missing: bool = False) -> Any:
+                return "not a schema"
+
+        assert _arrow_schema(Simple()) is None  # type: ignore[arg-type]
+
+    def test_an_uncountable_input_reports_cannot_tell(self) -> None:
+        from lancedb_ray.io import _input_row_count
+
+        class Broken:
+            def count(self) -> int:
+                raise RuntimeError("plan could not be executed")
+
+        assert _input_row_count(Broken()) is None  # type: ignore[arg-type]
+
+    def test_an_uncountable_input_is_never_papered_over(
+        self, db_dir: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import lance_ray
+        from lancedb_ray import io as io_module
+
+        monkeypatch.setattr(lance_ray, "write_lance", lambda *a, **k: None)
+        monkeypatch.setattr(io_module, "_input_row_count", lambda ds: None)
+        with pytest.raises(RuntimeError, match="input was not empty"):
+            write_lancedb(
+                dataset_of(make_table(0)),
+                "items",
+                uri=db_dir,
+                mode="create",
+                schema=make_table(0).schema,
+            )
+
+
 class TestFailedWriteAtomicity:
     """A distributed write that fails partway must not half-land.
 
