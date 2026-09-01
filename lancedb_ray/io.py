@@ -531,6 +531,12 @@ def _write_local_fragments(
     else:
         lance_mode = "append"
 
+    # An input with no rows produces no fragments, and lance-ray then commits
+    # nothing at all -- leaving the dataset exactly as it was, at the same
+    # version. That is correct for an append and wrong for an overwrite, so the
+    # version is recorded here to tell the two apart afterwards.
+    version_before = _dataset_version(dataset_uri, spec) if exists else None
+
     lance_ray.write_lance(
         ds,
         uri=dataset_uri,
@@ -542,6 +548,9 @@ def _write_local_fragments(
         ray_remote_args=ray_remote_args,
         concurrency=concurrency,
     )
+
+    if mode == "overwrite" and exists:
+        _finish_empty_overwrite(spec, table, dataset_uri, schema, version_before)
 
     # Confirm the database can now resolve what we materialised. Opening the
     # table directly is one call; re-listing the whole catalog is not.
@@ -564,3 +573,81 @@ def _write_local_fragments(
         f"cannot open a table named {table!r}. If the input was empty, pass "
         "schema=... so the table can be created from it."
     ) from resolve_error
+
+
+def _dataset_version(dataset_uri: str, spec: LanceDBConnectionSpec) -> Optional[int]:
+    """The current version of the Lance dataset at ``dataset_uri``, if readable.
+
+    ``None`` means the question could not be answered -- the dataset is absent,
+    or storage would not say. Callers must treat that as "cannot tell" rather
+    than as any particular version, because the comparison it feeds decides
+    whether to replace a table's contents.
+    """
+    import lance
+
+    try:
+        dataset = lance.dataset(
+            dataset_uri,
+            storage_options=(
+                dict(spec.storage_options) if spec.storage_options else None
+            ),
+        )
+        return int(dataset.version)
+    except Exception as error:  # noqa: BLE001 - absent or unreadable, same answer
+        logger.debug("Could not read the version of %s: %s", dataset_uri, error)
+        return None
+
+
+def _finish_empty_overwrite(
+    spec: LanceDBConnectionSpec,
+    table: str,
+    dataset_uri: str,
+    schema: Optional[pa.Schema],
+    version_before: Optional[int],
+) -> None:
+    """Make an overwrite whose input was empty actually empty the table.
+
+    ``write_lance`` commits nothing for a zero-row input, so an overwrite that
+    matched no rows leaves every previous row in place and reports success. A
+    nightly job whose filter came back empty would then publish yesterday's data
+    as today's, which is worse than either failing or emptying the table. The
+    Cloud/Enterprise path already replaces the table up front, so this also
+    stops the two backends disagreeing about what ``mode="overwrite"`` means.
+
+    An unchanged version is the signal that nothing was committed. Both probes
+    have to succeed for that comparison to mean anything: if either could not
+    read the version, the table is left alone, because the cost of being wrong
+    here is deleting rows the caller wanted to keep.
+    """
+    version_after = _dataset_version(dataset_uri, spec)
+    if version_before is None or version_after is None:
+        logger.warning(
+            "Could not confirm whether the overwrite of %s committed anything, "
+            "so its previous contents were left in place. If the input was "
+            "empty, the table still holds the rows it had before.",
+            table,
+        )
+        return
+    if version_after != version_before:
+        return
+
+    # Nothing was committed, so the input had no rows. Reuse the existing
+    # schema when the caller did not name one -- an empty overwrite is a
+    # request to keep the table and drop its rows, not to reshape it.
+    effective_schema = schema
+    if effective_schema is None:
+        import lance
+
+        effective_schema = lance.dataset(
+            dataset_uri,
+            storage_options=(
+                dict(spec.storage_options) if spec.storage_options else None
+            ),
+        ).schema
+
+    logger.info(
+        "Overwrite of %s had no rows to write; replacing it with an empty "
+        "table rather than leaving its previous contents in place.",
+        table,
+    )
+    connect(spec).create_table(table, schema=effective_schema, mode="overwrite")
