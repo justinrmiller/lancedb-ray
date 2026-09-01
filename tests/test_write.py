@@ -775,3 +775,116 @@ class TestConcurrencyValidation:
         db_dir, _ = seeded_local
         assert read_lancedb("items", uri=db_dir, concurrency=None).count() == 100
         assert read_lancedb("items", uri=db_dir, concurrency=2).count() == 100
+
+
+class TestFragmentWriteOptions:
+    """Options that describe the Lance files a fragment write produces.
+
+    They have no analogue on the table API path, so a write that does not take
+    the fragment path has to refuse them rather than drop them silently.
+    """
+
+    def test_stable_row_ids_reach_the_dataset(self, db_dir: str) -> None:
+        write_lancedb(
+            dataset_of(make_table(100), blocks=4),
+            "items",
+            uri=db_dir,
+            mode="create",
+            enable_stable_row_ids=True,
+        )
+
+        ds = lance.dataset(f"{db_dir}/items.lance")  # type: ignore[no-untyped-call]
+        fragments = ds.get_fragments()
+        # A fragment carries row-ID metadata only when stable IDs are on;
+        # without them this is None and a row's address moves under compaction.
+        assert fragments and all(f.metadata.row_id_meta is not None for f in fragments)
+
+    def test_stable_row_ids_are_off_by_default(self, db_dir: str) -> None:
+        """The default has to be observably off, or the flag proves nothing."""
+        write_lancedb(
+            dataset_of(make_table(100), blocks=4), "items", uri=db_dir, mode="create"
+        )
+
+        ds = lance.dataset(f"{db_dir}/items.lance")  # type: ignore[no-untyped-call]
+        fragments = ds.get_fragments()
+        assert fragments and all(f.metadata.row_id_meta is None for f in fragments)
+
+    def test_data_storage_version_reaches_the_dataset(self, db_dir: str) -> None:
+        write_lancedb(
+            dataset_of(make_table(50)),
+            "items",
+            uri=db_dir,
+            mode="create",
+            data_storage_version="stable",
+        )
+        assert read_lancedb("items", uri=db_dir).count() == 50
+
+    def test_default_write_leaves_both_alone(self, db_dir: str) -> None:
+        write_lancedb(dataset_of(make_table(20)), "items", uri=db_dir, mode="create")
+        assert read_lancedb("items", uri=db_dir).count() == 20
+
+    def test_refused_against_cloud_enterprise(
+        self, remote_uri: str, remote_kwargs: dict[str, Any]
+    ) -> None:
+        with pytest.raises(ValueError, match="enable_stable_row_ids only applies"):
+            write_lancedb(
+                dataset_of(make_table(10)),
+                "items",
+                uri=remote_uri,
+                mode="create",
+                enable_stable_row_ids=True,
+                **remote_kwargs,
+            )
+
+    def test_refused_for_an_upsert(self, db_dir: str) -> None:
+        write_lancedb(dataset_of(make_table(10)), "items", uri=db_dir, mode="create")
+        with pytest.raises(ValueError, match="data_storage_version only applies"):
+            write_lancedb(
+                dataset_of(make_table(10)),
+                "items",
+                uri=db_dir,
+                mode="upsert",
+                on="id",
+                data_storage_version="stable",
+            )
+
+    def test_refused_when_the_api_path_is_forced(self, db_dir: str) -> None:
+        with pytest.raises(ValueError, match="only applies to the local fragment"):
+            write_lancedb(
+                dataset_of(make_table(10)),
+                "items",
+                uri=db_dir,
+                mode="create",
+                local_write_strategy="api",
+                enable_stable_row_ids=True,
+            )
+
+    def test_both_are_named_when_both_are_unusable(self, db_dir: str) -> None:
+        with pytest.raises(ValueError, match="data_storage_version, enable_stable"):
+            write_lancedb(
+                dataset_of(make_table(10)),
+                "items",
+                uri=db_dir,
+                mode="create",
+                local_write_strategy="api",
+                data_storage_version="stable",
+                enable_stable_row_ids=True,
+            )
+
+
+class TestMaxBytesPerRequest:
+    def test_a_byte_ceiling_splits_a_task_into_transactions(self, db_dir: str) -> None:
+        """The byte ceiling has to reach the sink, the same way rows do."""
+        arrow = make_table(400)
+        write_lancedb(
+            dataset_of(arrow),
+            "items",
+            uri=db_dir,
+            mode="create",
+            local_write_strategy="api",
+            max_bytes_per_request=arrow.nbytes // 8,
+        )
+
+        assert read_lancedb("items", uri=db_dir).count() == 400
+        # Creation plus more than one append, because the ceiling split the task.
+        assert version_count(db_dir) > 2

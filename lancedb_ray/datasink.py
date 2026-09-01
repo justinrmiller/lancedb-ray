@@ -14,7 +14,7 @@ which delegates to ``lance-ray``.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from typing import TYPE_CHECKING, Any, Literal, Optional, Union
 
 import pyarrow as pa
@@ -23,7 +23,7 @@ from ray.data.block import Block, BlockAccessor
 from ray.data.datasource import Datasink
 from ray.data.datasource.datasink import WriteResult
 
-from ._plan import split_arrow_table
+from ._plan import rows_within_byte_budget, split_arrow_table
 from ._retry import (
     RetryPolicy,
     call_with_retry,
@@ -113,12 +113,49 @@ def _realign(batches: list[pa.RecordBatch], schema: pa.Schema) -> list[pa.Record
     bytes, and the import panics rather than degrading. ``take`` runs in
     Arrow's own kernels and allocates fresh output, which an IPC round-trip
     does not: reading an IPC stream back is itself zero-copy over the buffer.
+
+    Realigning one batch at a time rather than taking over a single combined
+    table matters at the sizes a write task reaches. ``take`` across a table's
+    chunks concatenates them, and a 32-bit-offset ``string`` or ``binary``
+    column whose combined data passes 2GB overflows those offsets -- a task
+    holding ``rows_per_transaction`` rows of image bytes gets there easily. Per
+    batch, the concatenation never happens, and peak extra memory is one batch
+    rather than the whole task.
     """
-    table = pa.Table.from_batches(batches, schema=schema)
-    indices = pa.array(range(table.num_rows), pa.int64())
-    realigned: pa.Table = pc.take(table, indices)
-    batches_out: list[pa.RecordBatch] = realigned.to_batches()
-    return batches_out
+    realigned: list[pa.RecordBatch] = []
+    for batch in batches:
+        indices = pa.array(range(batch.num_rows), pa.int64())
+        taken = pc.take(batch, indices)
+        # Rebuild against the declared schema: the batches came from separate
+        # blocks, and ``RecordBatchReader.from_batches`` requires every batch to
+        # match the one schema it advertises.
+        realigned.append(pa.RecordBatch.from_arrays(taken.columns, schema=schema))
+    return realigned
+
+
+def _slice_to_ceilings(
+    batch: pa.RecordBatch, max_rows: Optional[int], max_bytes: Optional[int]
+) -> Iterator[pa.RecordBatch]:
+    """Cut one batch into pieces that respect both ceilings.
+
+    A single incoming batch can exceed either limit on its own, so the limits
+    have to bound the slices themselves and not merely how many of them
+    accumulate before a flush.
+    """
+    limit = batch.num_rows
+    if max_rows is not None:
+        limit = min(limit, max_rows)
+    if max_bytes is not None:
+        limit = min(
+            limit, rows_within_byte_budget(batch.num_rows, batch.nbytes, max_bytes)
+        )
+
+    if limit >= batch.num_rows:
+        yield batch
+        return
+
+    for piece in split_arrow_table(batch.num_rows, limit):
+        yield batch.slice(piece.start, piece.num_rows)
 
 
 def _align_to_schema(block: pa.Table, schema: pa.Schema) -> pa.Table:
@@ -162,6 +199,12 @@ class LanceDBDatasink(Datasink[WriteStats]):
         min_rows_per_write: Rows accumulated before a request is issued.
         max_rows_per_request: Ceiling on rows in a single request; larger
             accumulations are split.
+        max_bytes_per_request: Ceiling on the in-memory size of a single
+            request. A row ceiling alone does not bound memory -- a row holding
+            a 1536-dimension embedding is 6KB and one holding a JPEG is
+            unbounded -- so a wide enough schema exhausts the worker long
+            before ``max_rows_per_request`` is reached. Whichever ceiling a
+            request meets first closes it.
         transform_fn: Optional per-batch transform applied before writing,
             for enrichment such as computing embeddings.
         when_matched_update_all: For upserts, update rows that matched.
@@ -185,6 +228,7 @@ class LanceDBDatasink(Datasink[WriteStats]):
         schema: Optional[pa.Schema] = None,
         rows_per_transaction: int = 256 * 1024,
         max_rows_per_request: Optional[int] = None,
+        max_bytes_per_request: Optional[int] = None,
         write_parallelism: Optional[int] = None,
         transform_fn: Optional[TransformFn] = None,
         when_matched_update_all: bool = True,
@@ -202,6 +246,10 @@ class LanceDBDatasink(Datasink[WriteStats]):
             raise ValueError(
                 f"max_rows_per_request must be positive, got {max_rows_per_request}"
             )
+        if max_bytes_per_request is not None and max_bytes_per_request <= 0:
+            raise ValueError(
+                f"max_bytes_per_request must be positive, got {max_bytes_per_request}"
+            )
         if on_batch_error not in ("raise", "skip"):
             raise ValueError(
                 f"on_batch_error must be 'raise' or 'skip', got {on_batch_error!r}"
@@ -214,6 +262,7 @@ class LanceDBDatasink(Datasink[WriteStats]):
         self._schema = schema
         self._rows_per_transaction = rows_per_transaction
         self._max_rows_per_request = max_rows_per_request
+        self._max_bytes_per_request = max_bytes_per_request
         self._write_parallelism = write_parallelism
         self._transform_fn = transform_fn
         self._when_matched_update_all = when_matched_update_all
@@ -322,7 +371,9 @@ class LanceDBDatasink(Datasink[WriteStats]):
         if not batches or schema is None:
             return stats
 
-        if self._max_rows_per_request is not None:
+        if self._max_rows_per_request is not None or (
+            self._max_bytes_per_request is not None
+        ):
             # Opt-in: trade extra transactions for a lower memory ceiling.
             self._write_in_chunks(table, schema, batches, stats)
         else:
@@ -387,27 +438,43 @@ class LanceDBDatasink(Datasink[WriteStats]):
         batches: list[pa.RecordBatch],
         stats: WriteStats,
     ) -> None:
-        """Write in bounded pieces when a memory ceiling was requested."""
-        assert self._max_rows_per_request is not None
-        limit = self._max_rows_per_request
+        """Write in bounded pieces when a memory ceiling was requested.
+
+        Either ceiling may be set, or both. Rows are the cheaper knob to reason
+        about; bytes are the one that actually corresponds to what the worker
+        has to hold. A chunk closes as soon as it meets either.
+        """
+        max_rows = self._max_rows_per_request
+        max_bytes = self._max_bytes_per_request
+        assert max_rows is not None or max_bytes is not None
 
         chunk: list[pa.RecordBatch] = []
         chunk_rows = 0
+        chunk_bytes = 0
 
         def flush() -> None:
-            nonlocal chunk, chunk_rows
+            nonlocal chunk, chunk_rows, chunk_bytes
             if not chunk:
                 return
             self._write_once(table, schema, chunk, chunk_rows, stats)
-            chunk, chunk_rows = [], 0
+            chunk, chunk_rows, chunk_bytes = [], 0, 0
 
         for batch in batches:
-            for piece in split_arrow_table(batch.num_rows, limit):
-                sliced = batch.slice(piece.start, piece.num_rows)
-                chunk.append(sliced)
-                chunk_rows += sliced.num_rows
-                if chunk_rows >= limit:
+            for piece in _slice_to_ceilings(batch, max_rows, max_bytes):
+                # Close the chunk *before* the piece that would overflow it,
+                # not after. Flushing on "already over" lets a chunk reach
+                # nearly twice the ceiling, which defeats the point of asking
+                # for one -- the caller set it because that is the memory they
+                # have. Each piece already fits a chunk on its own, so this
+                # always terminates.
+                overflows = (
+                    max_rows is not None and chunk_rows + piece.num_rows > max_rows
+                ) or (max_bytes is not None and chunk_bytes + piece.nbytes > max_bytes)
+                if chunk and overflows:
                     flush()
+                chunk.append(piece)
+                chunk_rows += piece.num_rows
+                chunk_bytes += piece.nbytes
         flush()
 
     def _write_reader(self, table: Any, reader: pa.RecordBatchReader) -> None:

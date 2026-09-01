@@ -16,6 +16,7 @@ __all__ = [
     "OffsetRange",
     "chunk_offsets",
     "plan_offset_shards",
+    "rows_within_byte_budget",
     "split_arrow_table",
 ]
 
@@ -108,3 +109,41 @@ def split_arrow_table(num_rows: int, max_rows: int) -> list[OffsetRange]:
         OffsetRange(start, min(start + max_rows, num_rows))
         for start in range(0, num_rows, max_rows)
     ]
+
+
+def rows_within_byte_budget(num_rows: int, nbytes: int, max_bytes: int) -> int:
+    """Largest slice of a batch whose share of ``nbytes`` fits in ``max_bytes``.
+
+    A row count does not bound memory. One row of a 1536-dimension float32
+    embedding is 6KB and one row carrying a JPEG is unbounded, so a schema wide
+    enough exhausts a worker long before any row limit is reached. Sizing a
+    slice by the batch's own average row width is what makes the ceiling
+    actually about bytes.
+
+    The estimate is uniform across rows, so a batch with a few outlying rows can
+    still overshoot -- this is a ceiling on the common case, not a hard bound.
+
+    Args:
+        num_rows: Rows in the batch being split.
+        nbytes: In-memory size of that batch.
+        max_bytes: Byte budget for one slice. Must be positive.
+
+    Returns:
+        A row count in ``[1, num_rows]``, or ``0`` when the batch is empty.
+        Never zero for a non-empty batch: a single row that exceeds the budget
+        on its own still has to be written, and refusing it would deadlock the
+        write rather than bound it.
+    """
+    if num_rows < 0:
+        raise ValueError(f"num_rows must not be negative, got {num_rows}")
+    if nbytes < 0:
+        raise ValueError(f"nbytes must not be negative, got {nbytes}")
+    if max_bytes <= 0:
+        raise ValueError(f"max_bytes must be positive, got {max_bytes}")
+
+    if num_rows == 0 or nbytes <= max_bytes:
+        return num_rows
+
+    # Integer arithmetic throughout: at these magnitudes a float ratio can
+    # round a slice up past the budget it was supposed to enforce.
+    return max(1, (max_bytes * num_rows) // nbytes)

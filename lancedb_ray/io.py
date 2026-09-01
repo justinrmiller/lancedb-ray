@@ -98,6 +98,7 @@ def read_lancedb(
     version: Optional[Union[int, str]] = None,
     remote_read_strategy: RemoteReadStrategy = "auto",
     batch_size: int = 50_000,
+    scanner_options: Optional[Mapping[str, Any]] = None,
     ray_remote_args: Optional[dict[str, Any]] = None,
     concurrency: Optional[int] = None,
     override_num_blocks: Optional[int] = None,
@@ -143,6 +144,13 @@ def read_lancedb(
         remote_read_strategy: Remote sharding strategy -- ``auto`` (default),
             ``offsets``, ``pagination`` or ``single``. Ignored for local tables.
         batch_size: Rows per request issued by each remote read task.
+        scanner_options: Extra options for the Lance scanner on **local** reads
+            -- ``batch_size``, ``use_scalar_index``, ``late_materialization``,
+            ``with_row_id`` and friends. Without this the local scan is only
+            tunable through ``columns`` and ``filter``, which leaves the scan
+            knobs that matter for a wide table unreachable. ``columns`` and
+            ``filter`` are set from their own arguments and win over anything
+            named here. Rejected for ``db://`` URIs, which have no scanner.
         ray_remote_args: Resource arguments for the read tasks.
         concurrency: Maximum number of concurrent read tasks.
         override_num_blocks: Override the number of output blocks.
@@ -169,9 +177,18 @@ def read_lancedb(
             columns=columns,
             filter=filter,
             version=version,
+            scanner_options=scanner_options,
             ray_remote_args=ray_remote_args,
             concurrency=concurrency,
             override_num_blocks=override_num_blocks,
+        )
+
+    if scanner_options:
+        # Silently dropping these would look like a tuning that did nothing.
+        raise ValueError(
+            "scanner_options applies to the Lance scanner, which only exists "
+            f"for local tables; {uri!r} is Cloud/Enterprise. Use batch_size and "
+            "remote_read_strategy to tune a remote read."
         )
 
     datasource = LanceDBDatasource(
@@ -201,6 +218,7 @@ def _read_local(
     columns: Optional[list[str]],
     filter: Optional[str],
     version: Optional[Union[int, str]],
+    scanner_options: Optional[Mapping[str, Any]],
     ray_remote_args: Optional[dict[str, Any]],
     concurrency: Optional[int],
     override_num_blocks: Optional[int],
@@ -224,6 +242,7 @@ def _read_local(
         filter=filter,
         storage_options=dict(spec.storage_options) if spec.storage_options else None,
         dataset_options={"version": pinned},
+        scanner_options=dict(scanner_options) if scanner_options else None,
         ray_remote_args=ray_remote_args,
         concurrency=concurrency,
         override_num_blocks=override_num_blocks,
@@ -249,6 +268,7 @@ def write_lancedb(
     transform_fn: Optional[TransformFn] = None,
     rows_per_transaction: int = 256 * 1024,
     max_rows_per_request: Optional[int] = None,
+    max_bytes_per_request: Optional[int] = None,
     write_parallelism: Optional[int] = None,
     when_matched_update_all: bool = True,
     when_not_matched_insert_all: bool = True,
@@ -257,6 +277,8 @@ def write_lancedb(
     local_write_strategy: LocalWriteStrategy = "auto",
     max_rows_per_file: int = 1024 * 1024,
     min_rows_per_file: int = 1024,
+    data_storage_version: Optional[str] = None,
+    enable_stable_row_ids: bool = False,
     retry_policy: Optional[RetryPolicy] = None,
     ray_remote_args: Optional[dict[str, Any]] = None,
     concurrency: Optional[int] = None,
@@ -318,6 +340,13 @@ def write_lancedb(
             append switches that write to the API path.
         min_rows_per_write: Rows accumulated per request on the API path.
         max_rows_per_request: Ceiling on rows in a single request.
+        max_bytes_per_request: Ceiling on the in-memory size of a single
+            request, on the API path. Rows are a poor proxy for memory once a
+            schema is wide -- 256K rows of a 1536-dimension float32 embedding is
+            1.5GB before anything else in the row is counted -- so this is the
+            ceiling to set when a task is being killed for memory rather than
+            taking too long. Combines with ``max_rows_per_request``; whichever
+            is met first closes the request.
         when_matched_update_all: For upserts, update rows that matched.
         when_not_matched_insert_all: For upserts, insert rows that did not match.
         when_not_matched_by_source_delete: For upserts, delete unmatched target
@@ -334,6 +363,13 @@ def write_lancedb(
             applies; ``fragment`` forces it; ``api`` forces the table API.
         max_rows_per_file: Fragment sizing for the fragment path.
         min_rows_per_file: Fragment sizing for the fragment path.
+        data_storage_version: Lance file format version for newly written
+            fragments (``"stable"``, ``"2.1"``, ...). Fragment path only.
+        enable_stable_row_ids: Give rows IDs that survive compaction, on the
+            fragment path. Off by default because it costs an index, but it is
+            fixed when the dataset is created -- a table written without it
+            cannot be switched later without a rewrite -- so it is worth
+            deciding at creation rather than discovering afterwards.
         retry_policy: Retry behaviour for failed batches on the API path.
         ray_remote_args: Resource arguments for the write tasks.
         concurrency: Maximum number of concurrent write tasks. Local upserts
@@ -386,10 +422,17 @@ def write_lancedb(
             schema=schema,
             max_rows_per_file=max_rows_per_file,
             min_rows_per_file=min_rows_per_file,
+            data_storage_version=data_storage_version,
+            enable_stable_row_ids=enable_stable_row_ids,
             ray_remote_args=ray_remote_args,
             concurrency=concurrency,
         )
         return
+
+    _reject_fragment_only_options(
+        data_storage_version=data_storage_version,
+        enable_stable_row_ids=enable_stable_row_ids,
+    )
 
     if concurrency is None and not spec.is_remote and mode == "upsert":
         # Hash partitioning already rules out same-key races; this cap is purely
@@ -407,6 +450,7 @@ def write_lancedb(
         schema=schema,
         rows_per_transaction=rows_per_transaction,
         max_rows_per_request=max_rows_per_request,
+        max_bytes_per_request=max_bytes_per_request,
         write_parallelism=write_parallelism,
         transform_fn=transform_fn,
         when_matched_update_all=when_matched_update_all,
@@ -418,6 +462,30 @@ def write_lancedb(
     ds.write_datasink(
         datasink, ray_remote_args=ray_remote_args, concurrency=concurrency
     )
+
+
+def _reject_fragment_only_options(
+    *, data_storage_version: Optional[str], enable_stable_row_ids: bool
+) -> None:
+    """Refuse fragment-path options on a write that will not take that path.
+
+    Both are properties of the Lance files a fragment write produces, so the
+    table API has nowhere to put them. Accepting and ignoring them would be
+    worse than refusing: ``enable_stable_row_ids`` is fixed at dataset creation,
+    so a caller who thinks they enabled it and did not finds out only when they
+    need the IDs and the dataset has to be rewritten.
+    """
+    unusable = []
+    if data_storage_version is not None:
+        unusable.append("data_storage_version")
+    if enable_stable_row_ids:
+        unusable.append("enable_stable_row_ids")
+    if unusable:
+        raise ValueError(
+            f"{', '.join(unusable)} only applies to the local fragment write "
+            "path, which this write does not take (Cloud/Enterprise, "
+            "mode='upsert' or local_write_strategy='api')."
+        )
 
 
 def _can_race(concurrency: Optional[int]) -> bool:
@@ -501,6 +569,8 @@ def _write_local_fragments(
     schema: Optional[pa.Schema],
     max_rows_per_file: int,
     min_rows_per_file: int,
+    data_storage_version: Optional[str],
+    enable_stable_row_ids: bool,
     ray_remote_args: Optional[dict[str, Any]],
     concurrency: Optional[int],
 ) -> None:
@@ -544,6 +614,8 @@ def _write_local_fragments(
         mode=lance_mode,
         max_rows_per_file=max_rows_per_file,
         min_rows_per_file=min_rows_per_file,
+        data_storage_version=data_storage_version,
+        enable_stable_row_ids=enable_stable_row_ids,
         storage_options=dict(spec.storage_options) if spec.storage_options else None,
         ray_remote_args=ray_remote_args,
         concurrency=concurrency,

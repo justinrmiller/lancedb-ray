@@ -80,6 +80,7 @@ Requires Python 3.12 or newer. CI tests against 3.12.
 | `version` | Table version to pin (defaults to current) |
 | `remote_read_strategy` | `auto` (default), `offsets`, `pagination`, `single` |
 | `batch_size` | Rows per request issued by each remote read task |
+| `scanner_options` | Extra Lance scanner options for a local read — `batch_size`, `use_scalar_index`, `late_materialization`, `with_row_id` |
 | `api_key`, `region`, `host_override` | Cloud/Enterprise connection |
 | `storage_options`, `client_config` | Object-store and HTTP client options |
 | `namespace_client_impl`, `namespace_client_properties` | Lance Namespace resolution |
@@ -95,8 +96,10 @@ Requires Python 3.12 or newer. CI tests against 3.12.
 | `on_batch_error` | `raise` (default) or `skip` |
 | `local_write_strategy` | `auto` (default), `fragment`, `api` |
 | `rows_per_transaction` | Rows Ray bundles per write task = transaction size |
-| `max_rows_per_request` | Optional memory ceiling; splits a task into several transactions |
+| `max_rows_per_request` | Optional row ceiling; splits a task into several transactions |
+| `max_bytes_per_request` | Optional memory ceiling in bytes — the one that actually bounds a wide schema |
 | `write_parallelism` | Parts the client uploads concurrently within one transaction |
+| `data_storage_version`, `enable_stable_row_ids` | Lance file format and row-ID stability for the fragment path |
 | `when_matched_update_all`, `when_not_matched_insert_all`, `when_not_matched_by_source_delete` | Merge-insert semantics |
 
 ## Examples
@@ -171,10 +174,18 @@ that to be true.
 - **`on_batch_error` defaults to `raise`.** Logging a failed write and continuing lets a
   job report success while having silently lost data. `skip` is available when partial
   completion genuinely is preferable, and dropped rows are counted and warned about.
-- **`max_rows_per_request` trades transactions for memory.** A task holds its rows in
-  memory so a failed write can be retried, so a very large `rows_per_transaction` raises
-  peak worker memory. Setting `max_rows_per_request` caps that, at the cost of splitting
-  the task back into several transactions.
+- **Cap a task's memory in bytes, not rows.** A task holds its rows in memory so a
+  failed write can be retried, so a large `rows_per_transaction` raises peak worker
+  memory. A row count is a poor proxy for that: the default 262,144 rows is a few MB of
+  scalars but 1.5GB of 1536-dimension embeddings, and unbounded if a row carries an
+  image. `max_bytes_per_request` sets the ceiling in the unit that actually runs out;
+  `max_rows_per_request` still works and the two combine, whichever is met first closing
+  the request. Either costs extra transactions.
+
+- **`enable_stable_row_ids` is decided at creation.** Stable IDs survive compaction,
+  which is what lets a later job address a row it saw earlier. They are off by default
+  because they cost an index — but a table written without them cannot be switched over
+  without a rewrite, so it is worth deciding up front rather than discovering later.
 - **Local upserts are deliberately not highly parallel.** Concurrent merge-insert against
   a single local dataset contends on the commit lock, so local upsert defaults to
   `concurrency=4` with conflict retry. Remote upserts have no such limit — the service
@@ -194,6 +205,39 @@ that to be true.
 - **API keys should come from `LANCEDB_API_KEY`** rather than the `api_key` argument, so
   the secret stays out of Ray task definitions and logs. The connection spec's `repr`
   redacts it either way.
+
+## Tuning
+
+Most of the cost of a large job is inside Lance's native core, not this library, and that
+core is configured by environment variables rather than by arguments. They have to be set
+on the Ray **workers**, so put them in the runtime environment rather than only in the
+driver's shell:
+
+```python
+ray.init(runtime_env={"env_vars": {"LANCE_IO_THREADS": "128"}})
+```
+
+| Variable | What it controls |
+| --- | --- |
+| `LANCE_IO_THREADS` | Concurrent read requests to storage. Raising it toward the core count helps a large scan against S3, where the default leaves the link idle. |
+| `LANCE_UPLOAD_CONCURRENCY` | Concurrent multipart upload streams. The write-side counterpart, and the first thing to raise if the fragment path is not saturating your bandwidth. |
+| `LANCE_INITIAL_UPLOAD_SIZE` | Starting multipart part size, in bytes. Larger parts mean fewer API calls on a big write and more memory per stream. Lance grows the part size as an upload progresses, so this only sets where it starts. |
+
+Two things worth knowing beyond the knobs:
+
+- **Lance is tuned for random access by default.** Point lookups, vector search and
+  selective column reads are what the defaults optimise for. A scan-heavy ETL job is the
+  case that benefits from raising the two thread counts above.
+- **Fixed-size lists for vectors, blob encoding for large binaries.** A vector column
+  stored as a fixed-size list compresses better and takes the SIMD path; large binary
+  payloads stored with Lance's blob encoding are not read unless a query touches them.
+  Both are properties of the schema you write, so they are decided before this library
+  sees the data.
+
+These are Lance-core knobs, so the same settings apply to
+[`lance-spark`](https://github.com/lance-format/lance-spark), whose
+[performance guide](https://lance.org/integrations/spark) covers them in more depth
+along with the JVM-only options.
 
 ## Development
 
