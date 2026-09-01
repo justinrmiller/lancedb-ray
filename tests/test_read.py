@@ -59,6 +59,15 @@ class TestProjectionAndFilter:
         assert set(ds.schema().names) == {"id", "label"}
         assert ds.count() == 50
 
+    def test_empty_column_list_is_rejected_on_both_backends(
+        self, backend: Backend
+    ) -> None:
+        # The two backends used to disagree: remote silently read every column
+        # and local produced a schema-less dataset. Neither is a projection.
+        backend.create("items", make_table(10))
+        with pytest.raises(ValueError, match=r"columns=\[\] selects no columns"):
+            read_lancedb("items", uri=backend.uri, columns=[], **backend.kwargs)
+
     def test_single_column_projection(self, backend: Backend) -> None:
         backend.create("items", make_table(30))
         ds = read_lancedb("items", uri=backend.uri, columns=["id"], **backend.kwargs)

@@ -35,7 +35,7 @@ from .datasink import (
     WriteMode,
     validate_write_args,
 )
-from .datasource import LanceDBDatasource, RemoteReadStrategy
+from .datasource import LanceDBDatasource, RemoteReadStrategy, validate_columns
 
 logger = logging.getLogger(__name__)
 
@@ -171,6 +171,10 @@ def read_lancedb(
         A Ray Dataset over the table's contents.
     """
     _validate_concurrency(concurrency)
+    # Checked before the local/remote split: the two paths hand ``columns`` to
+    # different engines, which disagree about what an empty list means (one
+    # reads every column, the other reads none). Neither is what was asked for.
+    validate_columns(columns)
     spec = _build_spec(
         uri,
         api_key,

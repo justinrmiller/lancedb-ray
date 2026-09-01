@@ -7,7 +7,7 @@ from typing import Any
 import pyarrow as pa
 import pytest
 from lancedb_ray.connection import LanceDBConnectionSpec
-from lancedb_ray.datasource import LanceDBDatasource
+from lancedb_ray.datasource import LanceDBDatasource, _apply_columns
 
 from conftest import make_table
 
@@ -50,6 +50,29 @@ class TestStrategySelection:
     ) -> None:
         with pytest.raises(ValueError, match="batch_size must be positive"):
             LanceDBDatasource(spec, "items", batch_size=0)
+
+
+class TestColumnProjection:
+    def test_empty_column_list_is_rejected(
+        self, spec: LanceDBConnectionSpec
+    ) -> None:
+        # An empty list used to be normalised to None, which silently read
+        # every column -- the opposite of the projection that was asked for.
+        with pytest.raises(ValueError, match="columns=\\[\\] selects no columns"):
+            LanceDBDatasource(spec, "items", columns=[])
+
+    def test_named_columns_are_kept(self, spec: LanceDBConnectionSpec) -> None:
+        source = LanceDBDatasource(spec, "items", columns=["id"])
+        assert source._columns == ["id"]
+
+    def test_no_projection_stays_none(self, spec: LanceDBConnectionSpec) -> None:
+        assert LanceDBDatasource(spec, "items")._columns is None
+
+    def test_apply_columns_guards_against_a_bypassed_constructor(self) -> None:
+        # Defence in depth: the helper runs inside workers, where a directly
+        # constructed datasource could still deliver an empty list.
+        with pytest.raises(ValueError, match="columns=\\[\\] selects no columns"):
+            _apply_columns(object(), [])
 
 
 class TestVersionPinning:

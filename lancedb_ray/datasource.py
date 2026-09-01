@@ -35,7 +35,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["LanceDBDatasource", "RemoteReadStrategy"]
+__all__ = ["LanceDBDatasource", "RemoteReadStrategy", "validate_columns"]
 
 RemoteReadStrategy = Literal["auto", "offsets", "pagination", "single"]
 
@@ -67,20 +67,27 @@ def _build_block_metadata(
     )
 
 
-def _apply_columns(query: Any, columns: Optional[list[str]]) -> Any:
-    """Apply a column projection to a query builder, if one was requested.
+def validate_columns(columns: Optional[list[str]]) -> None:
+    """Reject a projection that names no columns.
 
     ``None`` means no projection; an empty list is a caller mistake rather than
     a request for nothing, and silently returning every column would be the
-    opposite of what was asked for.
+    opposite of what was asked for. Checked on the driver so the job fails
+    before any task is scheduled, and checked again in :func:`_apply_columns`
+    because a datasource can be constructed directly.
     """
-    if columns is None:
-        return query
-    if not columns:
+    if columns is not None and not columns:
         raise ValueError(
             "columns=[] selects no columns. Pass columns=None (the default) to "
             "read every column, or name the ones you want."
         )
+
+
+def _apply_columns(query: Any, columns: Optional[list[str]]) -> Any:
+    """Apply a column projection to a query builder, if one was requested."""
+    if columns is None:
+        return query
+    validate_columns(columns)
     return query.select(columns)
 
 
@@ -245,9 +252,11 @@ class LanceDBDatasource(Datasource):
                 f"strategy must be one of {valid_strategies}, got {strategy!r}"
             )
 
+        validate_columns(columns)
+
         self._spec = spec
         self._table_name = table_name
-        self._columns = list(columns) if columns else None
+        self._columns = list(columns) if columns is not None else None
         self._filter = filter
         self._batch_size = batch_size
         self._retry_policy = retry_policy or RetryPolicy()
