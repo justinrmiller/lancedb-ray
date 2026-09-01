@@ -7,6 +7,7 @@ from lancedb_ray._retry import (
     RetryPolicy,
     call_with_retry,
     is_commit_conflict,
+    is_definitely_not_applied,
     is_transient,
 )
 
@@ -39,6 +40,30 @@ class TestClassification:
 
     def test_classification_is_case_insensitive(self) -> None:
         assert is_transient(RuntimeError("CONNECTION RESET"))
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "invalid vector dimension 1429",
+            "row 8503 has a null in a non-nullable column",
+            "expected 5029 bytes, got 12",
+            "payload of 15040 rows is too large",
+        ],
+    )
+    def test_a_status_code_inside_a_longer_number_is_not_transient(
+        self, message: str
+    ) -> None:
+        # A bare substring test read "429" out of "1429" and retried a
+        # deterministic schema error as though the service had wobbled.
+        assert not is_transient(RuntimeError(message))
+        assert not is_definitely_not_applied(RuntimeError(message))
+
+    @pytest.mark.parametrize(
+        "message",
+        ["HTTP 502 Bad Gateway", "status=504", "got 429 from the service"],
+    )
+    def test_a_standalone_status_code_is_still_transient(self, message: str) -> None:
+        assert is_transient(RuntimeError(message))
 
     @pytest.mark.parametrize(
         "message",
