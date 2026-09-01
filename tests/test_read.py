@@ -111,6 +111,79 @@ class TestProjectionAndFilter:
         assert sorted_ids(ds) == list(range(0, 100, 10))
 
 
+class TestBatchSize:
+    """``batch_size`` has to mean something on both backends.
+
+    It used to be documented as a read knob, validated for remote reads and
+    then silently dropped on local ones -- the same "tuning that did nothing"
+    that ``scanner_options`` is rejected for remotely.
+    """
+
+    def test_batch_size_reaches_the_local_scanner(
+        self, db_dir: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import lance_ray
+
+        seen: dict[str, object] = {}
+        original = lance_ray.read_lance
+
+        def spy(**kwargs: object) -> object:
+            seen.update(kwargs)
+            return original(**kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(lance_ray, "read_lance", spy)
+        Backend("local", db_dir, {}).create("items", make_table(10))
+        read_lancedb("items", uri=db_dir, batch_size=7)
+
+        assert seen["scanner_options"] == {"batch_size": 7}
+
+    def test_batch_size_wins_over_scanner_options(
+        self, db_dir: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import lance_ray
+
+        seen: dict[str, object] = {}
+        original = lance_ray.read_lance
+
+        def spy(**kwargs: object) -> object:
+            seen.update(kwargs)
+            return original(**kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(lance_ray, "read_lance", spy)
+        Backend("local", db_dir, {}).create("items", make_table(10))
+        read_lancedb(
+            "items",
+            uri=db_dir,
+            batch_size=7,
+            scanner_options={"batch_size": 99, "with_row_id": True},
+        )
+
+        assert seen["scanner_options"] == {"batch_size": 7, "with_row_id": True}
+
+    def test_omitting_it_leaves_the_scanner_alone(
+        self, db_dir: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import lance_ray
+
+        seen: dict[str, object] = {}
+        original = lance_ray.read_lance
+
+        def spy(**kwargs: object) -> object:
+            seen.update(kwargs)
+            return original(**kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(lance_ray, "read_lance", spy)
+        Backend("local", db_dir, {}).create("items", make_table(10))
+        read_lancedb("items", uri=db_dir)
+
+        assert seen["scanner_options"] is None
+
+    def test_a_batched_read_still_returns_every_row(self, backend: Backend) -> None:
+        backend.create("items", make_table(50))
+        ds = read_lancedb("items", uri=backend.uri, batch_size=7, **backend.kwargs)
+        assert sorted_ids(ds) == list(range(50))
+
+
 class TestVersionPinning:
     def test_reads_a_pinned_older_version(self, backend: Backend) -> None:
         backend.create("items", make_table(100))
@@ -178,6 +251,11 @@ class TestErrors:
         # table, so match on the name rather than pinning a class.
         with pytest.raises(Exception, match="nope"):
             read_lancedb("nope", uri=backend.uri, **backend.kwargs)
+
+    def test_rejects_bad_batch_size_on_both_backends(self, backend: Backend) -> None:
+        backend.create("items", make_table(10))
+        with pytest.raises(ValueError, match="batch_size must be positive"):
+            read_lancedb("items", uri=backend.uri, batch_size=0, **backend.kwargs)
 
     def test_rejects_bad_batch_size(self, seeded_remote: tuple[str, pa.Table]) -> None:
         uri, _ = seeded_remote

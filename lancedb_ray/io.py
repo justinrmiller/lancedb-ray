@@ -35,7 +35,12 @@ from .datasink import (
     WriteMode,
     validate_write_args,
 )
-from .datasource import LanceDBDatasource, RemoteReadStrategy, validate_columns
+from .datasource import (
+    DEFAULT_BATCH_SIZE,
+    LanceDBDatasource,
+    RemoteReadStrategy,
+    validate_columns,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -109,7 +114,7 @@ def read_lancedb(
     filter: Optional[str] = None,
     version: Optional[Union[int, str]] = None,
     remote_read_strategy: RemoteReadStrategy = "auto",
-    batch_size: int = 50_000,
+    batch_size: Optional[int] = None,
     scanner_options: Optional[Mapping[str, Any]] = None,
     ray_remote_args: Optional[dict[str, Any]] = None,
     concurrency: Optional[int] = None,
@@ -155,7 +160,10 @@ def read_lancedb(
         version: Table version to pin. Defaults to the current version.
         remote_read_strategy: Remote sharding strategy -- ``auto`` (default),
             ``offsets``, ``pagination`` or ``single``. Ignored for local tables.
-        batch_size: Rows per request issued by each remote read task.
+        batch_size: Rows fetched per read request. On a remote read this sizes
+            each task's requests; on a local read it sizes the Lance scanner's
+            batches, and takes precedence over a ``batch_size`` named in
+            ``scanner_options``. Defaults to the backend's own sizing.
         scanner_options: Extra options for the Lance scanner on **local** reads
             -- ``batch_size``, ``use_scalar_index``, ``late_materialization``,
             ``with_row_id`` and friends. Without this the local scan is only
@@ -171,6 +179,8 @@ def read_lancedb(
         A Ray Dataset over the table's contents.
     """
     _validate_concurrency(concurrency)
+    if batch_size is not None and batch_size <= 0:
+        raise ValueError(f"batch_size must be positive, got {batch_size}")
     # Checked before the local/remote split: the two paths hand ``columns`` to
     # different engines, which disagree about what an empty list means (one
     # reads every column, the other reads none). Neither is what was asked for.
@@ -193,6 +203,7 @@ def read_lancedb(
             columns=columns,
             filter=filter,
             version=version,
+            batch_size=batch_size,
             scanner_options=scanner_options,
             ray_remote_args=ray_remote_args,
             concurrency=concurrency,
@@ -214,7 +225,7 @@ def read_lancedb(
         filter=filter,
         version=version,
         strategy=remote_read_strategy,
-        batch_size=batch_size,
+        batch_size=batch_size if batch_size is not None else DEFAULT_BATCH_SIZE,
     )
     return cast(
         "Dataset",
@@ -234,6 +245,7 @@ def _read_local(
     columns: Optional[list[str]],
     filter: Optional[str],
     version: Optional[Union[int, str]],
+    batch_size: Optional[int],
     scanner_options: Optional[Mapping[str, Any]],
     ray_remote_args: Optional[dict[str, Any]],
     concurrency: Optional[int],
@@ -252,13 +264,21 @@ def _read_local(
     # independently and could disagree.
     pinned = version if version is not None else dataset.version
 
+    # ``batch_size`` is a scanner option locally. Folding it in here is what
+    # makes the argument mean the same thing on both backends -- it used to be
+    # accepted and then silently dropped, which is the "tuning that did
+    # nothing" that ``scanner_options`` is rejected for remotely.
+    scan_opts = dict(scanner_options) if scanner_options else {}
+    if batch_size is not None:
+        scan_opts["batch_size"] = batch_size
+
     return lance_ray.read_lance(
         uri=dataset.uri,
         columns=columns,
         filter=filter,
         storage_options=dict(spec.storage_options) if spec.storage_options else None,
         dataset_options={"version": pinned},
-        scanner_options=dict(scanner_options) if scanner_options else None,
+        scanner_options=scan_opts or None,
         ray_remote_args=ray_remote_args,
         concurrency=concurrency,
         override_num_blocks=override_num_blocks,

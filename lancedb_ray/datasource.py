@@ -35,12 +35,20 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["LanceDBDatasource", "RemoteReadStrategy", "validate_columns"]
+__all__ = [
+    "DEFAULT_BATCH_SIZE",
+    "LanceDBDatasource",
+    "RemoteReadStrategy",
+    "validate_columns",
+]
 
 RemoteReadStrategy = Literal["auto", "offsets", "pagination", "single"]
 
 #: Rows sampled to estimate the in-memory size of a remote table.
 _SIZE_SAMPLE_ROWS = 32
+
+#: Rows fetched per request by a remote read task when the caller names none.
+DEFAULT_BATCH_SIZE = 50_000
 
 
 def _build_block_metadata(
@@ -267,7 +275,7 @@ class LanceDBDatasource(Datasource):
         filter: Optional[str] = None,
         version: Optional[Union[int, str]] = None,
         strategy: RemoteReadStrategy = "auto",
-        batch_size: int = 50_000,
+        batch_size: int = DEFAULT_BATCH_SIZE,
         retry_policy: Optional[RetryPolicy] = None,
     ) -> None:
         if batch_size <= 0:
