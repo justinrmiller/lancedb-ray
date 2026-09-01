@@ -832,12 +832,35 @@ class TestEmptyCreate:
         import lance_ray
         from lancedb_ray import io as io_module
 
-        # Simulate a write that produces nothing resolvable *and* a dataset Ray
+        # An empty input that produces nothing resolvable *and* a dataset Ray
         # cannot report a schema for: the error should say what to pass.
         monkeypatch.setattr(lance_ray, "write_lance", lambda *a, **k: None)
         monkeypatch.setattr(io_module, "_arrow_schema", lambda ds: None)
         with pytest.raises(RuntimeError, match="schema="):
-            write_lancedb(dataset_of(make_table(5)), "items", uri=db_dir, mode="create")
+            write_lancedb(dataset_of(make_table(0)), "items", uri=db_dir, mode="create")
+
+    @pytest.mark.parametrize("schema_arg", [None, "explicit"])
+    def test_rows_that_vanished_are_never_papered_over(
+        self, db_dir: str, monkeypatch: pytest.MonkeyPatch, schema_arg: Any
+    ) -> None:
+        """An absent dataset is only benign when the input had no rows.
+
+        Standing an empty table where a completed write should be reports
+        success over the loss. Passing ``schema=`` used to be enough to reach
+        that path with a non-empty input.
+        """
+        import lance_ray
+
+        monkeypatch.setattr(lance_ray, "write_lance", lambda *a, **k: None)
+        schema = make_table(0).schema if schema_arg else None
+        with pytest.raises(RuntimeError, match="Refusing to replace it"):
+            write_lancedb(
+                dataset_of(make_table(20)),
+                "items",
+                uri=db_dir,
+                mode="create",
+                schema=schema,
+            )
 
 
 class TestFailedWriteAtomicity:

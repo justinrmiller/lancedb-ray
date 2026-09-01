@@ -672,6 +672,23 @@ def _write_local_fragments(
             "is left untouched rather than replaced with an empty table."
         ) from resolve_error
 
+    # An absent dataset is only benign when the input genuinely had no rows.
+    # If it had rows, they went somewhere this write cannot account for, and
+    # putting an empty table at that URI would report success over the loss.
+    # Establish the count before assuming; "cannot tell" is not "empty".
+    num_input_rows = _input_row_count(ds)
+    if num_input_rows != 0:
+        raise RuntimeError(
+            f"The write produced no Lance dataset at {dataset_uri!r} and database "
+            f"{spec.uri!r} cannot open a table named {table!r}, but the input was "
+            + (
+                "not empty"
+                if num_input_rows is None
+                else f"{num_input_rows} rows"
+            )
+            + ". Refusing to replace it with an empty table."
+        ) from resolve_error
+
     # A job whose filter matched nothing still wants its table, so materialise
     # it from the schema rather than failing. Ray knows the input's schema even
     # when the input has no rows, and the table API path already creates the
@@ -718,6 +735,22 @@ def _arrow_schema(ds: Dataset) -> Optional[pa.Schema]:
         return None
     base = getattr(reported, "base_schema", reported)
     return base if isinstance(base, pa.Schema) else None
+
+
+def _input_row_count(ds: Dataset) -> Optional[int]:
+    """How many rows the input held, or ``None`` if Ray would not say.
+
+    Only called on the recovery path, where the write produced no dataset. For
+    the case that path exists to serve -- an input with no rows -- counting
+    executes an empty plan. For any other cause it costs a re-execution on the
+    way to raising, which is the right trade against silently standing an empty
+    table where a completed write should be.
+    """
+    try:
+        return int(ds.count())
+    except Exception as error:  # noqa: BLE001 - cannot tell; must not assume
+        logger.debug("Could not count the input dataset: %s", error)
+        return None
 
 
 def _dataset_state(dataset_uri: str, spec: LanceDBConnectionSpec) -> _DatasetState:
