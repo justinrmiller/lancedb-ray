@@ -53,9 +53,7 @@ class TestStrategySelection:
 
 
 class TestColumnProjection:
-    def test_empty_column_list_is_rejected(
-        self, spec: LanceDBConnectionSpec
-    ) -> None:
+    def test_empty_column_list_is_rejected(self, spec: LanceDBConnectionSpec) -> None:
         # An empty list used to be normalised to None, which silently read
         # every column -- the opposite of the projection that was asked for.
         with pytest.raises(ValueError, match="columns=\\[\\] selects no columns"):
@@ -365,9 +363,7 @@ class TestSingleStrategyExecution:
         self, spec: LanceDBConnectionSpec, strategy: str
     ) -> None:
         source = LanceDBDatasource(spec, "items", strategy=strategy)  # type: ignore[arg-type]
-        assert all(
-            t.per_task_row_limit is None for t in source.get_read_tasks(3)
-        )
+        assert all(t.per_task_row_limit is None for t in source.get_read_tasks(3))
 
 
 class TestPaginationEdgeCases:

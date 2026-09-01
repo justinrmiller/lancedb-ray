@@ -503,7 +503,11 @@ class TestHashShuffleRequirement:
 
         Backend("local", db_dir, {}).create("items", make_table(5))
         write_lancedb(
-            dataset_of(make_table(5, start=3)), "items", uri=db_dir, mode="upsert", on="id"
+            dataset_of(make_table(5, start=3)),
+            "items",
+            uri=db_dir,
+            mode="upsert",
+            on="id",
         )
         assert lancedb.connect(db_dir).open_table("items").count_rows() == 8
 

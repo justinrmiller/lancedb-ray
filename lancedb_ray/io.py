@@ -733,11 +733,7 @@ def _write_local_fragments(
         raise RuntimeError(
             f"The write produced no Lance dataset at {dataset_uri!r} and database "
             f"{spec.uri!r} cannot open a table named {table!r}, but the input was "
-            + (
-                "not empty"
-                if num_input_rows is None
-                else f"{num_input_rows} rows"
-            )
+            + ("not empty" if num_input_rows is None else f"{num_input_rows} rows")
             + ". Refusing to replace it with an empty table."
         ) from resolve_error
 

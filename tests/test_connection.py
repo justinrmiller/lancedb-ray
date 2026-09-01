@@ -52,9 +52,7 @@ class TestConnectionCacheBounds:
         assert info.maxsize is not None
         assert info.maxsize >= 2
 
-    def test_many_distinct_specs_do_not_grow_without_limit(
-        self, db_dir: str
-    ) -> None:
+    def test_many_distinct_specs_do_not_grow_without_limit(self, db_dir: str) -> None:
         from lancedb_ray.connection import (
             _CONNECTION_CACHE_SIZE,
             _connect_cached,
