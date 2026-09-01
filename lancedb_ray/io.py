@@ -543,6 +543,36 @@ def _can_race(concurrency: Optional[int]) -> bool:
     return concurrency is None or concurrency > 1
 
 
+#: Ray shuffle strategies that implement key-based repartitioning.
+_HASH_SHUFFLE_STRATEGIES = ("hash_shuffle", "hash_shuffle_v2", "gpu_shuffle")
+
+
+def _require_hash_shuffle() -> None:
+    """Fail early when Ray cannot hash-partition on a key.
+
+    ``repartition(keys=...)`` is implemented only for the hash-based shuffle
+    strategies. Under a sort-based one Ray raises at plan time, naming an
+    internal config rather than the upsert that needed it -- and the guarantee
+    the shuffle exists to provide would be gone either way. The default is
+    hash-based, so this only fires where a cluster has changed it.
+    """
+    try:
+        from ray.data.context import DataContext
+
+        strategy = DataContext.get_current().shuffle_strategy
+    except Exception:  # pragma: no cover - depends on the installed Ray
+        return
+    if str(getattr(strategy, "value", strategy)) in _HASH_SHUFFLE_STRATEGIES:
+        return
+    raise ValueError(
+        "mode='upsert' with partition_on_keys=True needs a hash-based shuffle "
+        f"to co-locate each key, but DataContext.shuffle_strategy is {strategy!r}. "
+        "Set it to ShuffleStrategy.HASH_SHUFFLE, or pass partition_on_keys=False "
+        "if the source's keys are already unique -- with repeated keys and more "
+        "than one write task, rows for the same key duplicate silently."
+    )
+
+
 def _hash_partition(
     ds: Dataset, keys: Optional[list[str]], concurrency: Optional[int]
 ) -> Dataset:
@@ -555,6 +585,8 @@ def _hash_partition(
     """
     if not keys:
         return ds
+
+    _require_hash_shuffle()
 
     num_blocks = concurrency if concurrency and concurrency > 0 else None
     if num_blocks is None:

@@ -454,6 +454,60 @@ class TestUpsertHashPartitioning:
         assert backend.count("items") == 100
 
 
+class TestHashShuffleRequirement:
+    def test_a_sort_shuffle_strategy_is_refused_with_a_usable_message(
+        self, db_dir: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Key-based repartitioning only exists under a hash shuffle.
+
+        Ray otherwise raises at plan time naming an internal config, and the
+        co-location the shuffle exists to guarantee would be gone regardless.
+        """
+        from ray.data.context import DataContext, ShuffleStrategy
+
+        Backend("local", db_dir, {}).create("items", make_table(5))
+        monkeypatch.setattr(
+            DataContext.get_current(),
+            "shuffle_strategy",
+            ShuffleStrategy.SORT_SHUFFLE_PULL_BASED,
+        )
+        with pytest.raises(ValueError, match="needs a hash-based shuffle"):
+            write_lancedb(
+                dataset_of(make_table(5)), "items", uri=db_dir, mode="upsert", on="id"
+            )
+
+    def test_the_escape_hatch_still_works_under_a_sort_shuffle(
+        self, db_dir: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import lancedb
+        from ray.data.context import DataContext, ShuffleStrategy
+
+        Backend("local", db_dir, {}).create("items", make_table(5))
+        monkeypatch.setattr(
+            DataContext.get_current(),
+            "shuffle_strategy",
+            ShuffleStrategy.SORT_SHUFFLE_PULL_BASED,
+        )
+        write_lancedb(
+            dataset_of(make_table(5, start=3)),
+            "items",
+            uri=db_dir,
+            mode="upsert",
+            on="id",
+            partition_on_keys=False,
+        )
+        assert lancedb.connect(db_dir).open_table("items").count_rows() == 8
+
+    def test_the_default_strategy_is_accepted(self, db_dir: str) -> None:
+        import lancedb
+
+        Backend("local", db_dir, {}).create("items", make_table(5))
+        write_lancedb(
+            dataset_of(make_table(5, start=3)), "items", uri=db_dir, mode="upsert", on="id"
+        )
+        assert lancedb.connect(db_dir).open_table("items").count_rows() == 8
+
+
 class TestUpsertShuffleAvoidance:
     def test_a_single_task_upsert_skips_the_shuffle(self, db_dir: str) -> None:
         """One write task cannot race with itself, so the guard is pure cost."""
