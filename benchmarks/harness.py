@@ -166,6 +166,33 @@ TIERS: dict[str, Tier] = {
         min_free_bytes=60 * _GB,
         description="opt-in; multi-GB and minutes per scenario",
     ),
+    # Narrow scales 20x but the vector datasets stop at 8x, which is not a
+    # preference: macOS caps Ray's object store at 2GB, so read_full's
+    # materialize() spills roughly a second copy of the table to disk, and
+    # upsert_merge holds one and a half. At 20x vector that peaks past a 128GB
+    # volume; at 8x it peaks near 68GB.
+    "xl": Tier(
+        name="xl",
+        rows={
+            "narrow": 400_000_000,
+            "vector": 64_000_000,
+            "wide_vector": 3_200_000,
+            "wide_scalar": 40_000_000,
+            "fidelity": 1_000_000,
+        },
+        # Up from full's 32. Blocks are what Ray schedules, and at 32 a vector
+        # block would be ~1GB -- eight of them in flight is four times the whole
+        # object store. At 256 every dataset lands in a 50-133MB block.
+        blocks=256,
+        # This tier exists for scale, not for timing stability. Every check and
+        # every gated counter still runs; one timed iteration rather than four
+        # is what makes the run finish in hours instead of days.
+        repeat=1,
+        warmup=0,
+        full_sweeps=True,
+        min_free_bytes=80 * _GB,
+        description="opt-in; 400M narrow rows and hours per run",
+    ),
 }
 
 
