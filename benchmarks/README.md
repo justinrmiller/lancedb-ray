@@ -133,6 +133,14 @@ A run leaves nothing behind, including when it is killed:
 
 - every directory lives under one run root, removed in a `finally`, and also
   registered with `atexit` and `SIGINT`/`SIGTERM`;
+- the `SIGTERM` handler is reinstalled after `ray.init`, which replaces it with
+  its own and silently drops whatever was there. Without that, a killed run
+  skipped cleanup entirely — one `xl` run left 39GB behind that way. Ray's
+  handler still runs; ours goes first, and again afterwards, because Ray's
+  processes write their session directory back on the way out;
+- a run sweeps stale run roots older than six hours at startup. Nothing catches
+  `SIGKILL`, and a process dying inside native code can abort before Python
+  regains control, so the in-process guarantees cannot be the only ones;
 - Ray's own temp directory is inside that root, and Ray is shut down alongside;
 - results go to `benchmarks/results/` (gitignored) or `BENCH_OUT_DIR`, never into
   the tracked tree;
@@ -140,6 +148,16 @@ A run leaves nothing behind, including when it is killed:
   `finally`, and sweep `bench_*` tables left by an earlier killed run;
 - CI asserts `git status --porcelain` is empty afterwards, so a leak fails the
   build rather than being discovered later.
+
+## Timeouts
+
+Every case runs under a per-tier wall-clock budget (`Tier.case_timeout_s`,
+overridable with `--case-timeout`; `0` disables it). A case that overruns is
+recorded as a failed case and the run moves on to the next one.
+
+This exists for the same reason `pyproject.toml` gives pytest `--timeout=300`: a
+LanceDB call can block in native code, and without a budget it takes the whole
+run with it rather than costing one case.
 
 ## In CI
 

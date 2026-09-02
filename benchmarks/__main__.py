@@ -86,6 +86,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--object-store-bytes", type=int, help="Ray object store size in bytes"
     )
     parser.add_argument(
+        "--blocks",
+        type=int,
+        default=None,
+        help="override the tier's Ray block count (isolates block-count effects)",
+    )
+    parser.add_argument(
+        "--case-timeout",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="per-case wall-clock budget; 0 disables (default: the tier's)",
+    )
+    parser.add_argument(
         "--run-root",
         default=os.environ.get("BENCH_RUN_ROOT"),
         help="where scratch directories go; removed when the run ends",
@@ -137,6 +150,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         warmup=args.warmup,
         num_cpus=args.num_cpus,
         object_store_bytes=args.object_store_bytes,
+        case_timeout_s=args.case_timeout,
+        blocks=args.blocks,
         run_root=args.run_root,
         baseline=args.compare,
         regression_factor=args.regression_factor,
@@ -150,6 +165,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if not planned:
         print("no scenarios selected", file=sys.stderr)
         return EXIT_FAILED
+
+    if run.swept_run_roots and not args.quiet:
+        print(
+            f"swept {run.swept_run_roots} stale run root(s) an earlier run left behind"
+        )
 
     utilization = run.disk_utilization()
     if utilization >= 0.95 and not args.quiet:

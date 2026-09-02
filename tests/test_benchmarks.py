@@ -11,9 +11,22 @@ scenarios and exited before running anything.
 
 from __future__ import annotations
 
+import contextlib
+import os
+import signal
+import time
+from pathlib import Path
+
 import pytest
 from benchmarks.counters import parse_plan_metrics
-from benchmarks.harness import TIERS
+from benchmarks.harness import (
+    TIERS,
+    BenchRun,
+    CaseTimeout,
+    RunConfig,
+    case_deadline,
+    sweep_stale_run_roots,
+)
 from benchmarks.scenarios import ALL_TIERS, select
 
 
@@ -97,3 +110,131 @@ class TestTierRegistry:
         from benchmarks.datagen import DATASETS
 
         assert set(TIERS[tier].rows) == set(DATASETS)
+
+
+class TestCaseDeadline:
+    """A stuck call must cost one case, not the whole run.
+
+    An ``xl`` run spent 91 minutes inside a single ``merge_insert`` before an
+    external signal ended it, taking every scenario after it. pytest carries
+    ``--timeout=300`` for exactly this; the benchmark had no equivalent.
+    """
+
+    def test_overrun_raises(self) -> None:
+        with pytest.raises(CaseTimeout, match="budget"), case_deadline(0.05):
+            time.sleep(5)
+
+    def test_work_inside_the_budget_is_untouched(self) -> None:
+        with case_deadline(30):
+            result = sum(range(1000))
+        assert result == 499_500
+
+    def test_timer_is_cleared_on_the_way_out(self) -> None:
+        """A leftover timer would fire during an unrelated later case."""
+        with case_deadline(0.5):
+            pass
+        time.sleep(1.0)  # would raise here if the itimer were still armed
+
+    def test_previous_handler_is_restored(self) -> None:
+        before = signal.getsignal(signal.SIGALRM)
+        with case_deadline(30):
+            pass
+        assert signal.getsignal(signal.SIGALRM) is before
+
+    @pytest.mark.parametrize("disabled", [None, 0, 0.0, -1])
+    def test_disabled_budget_is_a_noop(self, disabled: float | None) -> None:
+        with case_deadline(disabled):
+            pass
+
+    def test_nested_exception_still_clears_the_timer(self) -> None:
+        with contextlib.suppress(ValueError), case_deadline(30):
+            raise ValueError("boom")
+        assert signal.getitimer(signal.ITIMER_REAL)[0] == 0.0
+
+
+class TestSweepStaleRunRoots:
+    """Cleanup that only works in-process is not cleanup.
+
+    No handler catches SIGKILL, and a process dying in native code can abort
+    before Python regains control -- which left 39GB behind after one run. The
+    sweep is what makes the next run self-healing.
+    """
+
+    def test_removes_an_aged_root(self, tmp_path: Path) -> None:
+        stale = tmp_path / "ldbrbench_old"
+        stale.mkdir()
+        (stale / "data").write_text("x")
+        os.utime(stale, (time.time() - 7 * 3600, time.time() - 7 * 3600))
+
+        assert sweep_stale_run_roots(str(tmp_path), "ldbrbench_") == 1
+        assert not stale.exists()
+
+    def test_leaves_a_fresh_root_alone(self, tmp_path: Path) -> None:
+        """A concurrent run's directory must survive."""
+        fresh = tmp_path / "ldbrbench_running"
+        fresh.mkdir()
+
+        assert sweep_stale_run_roots(str(tmp_path), "ldbrbench_") == 0
+        assert fresh.exists()
+
+    def test_ignores_unrelated_directories(self, tmp_path: Path) -> None:
+        other = tmp_path / "something_else"
+        other.mkdir()
+        os.utime(other, (time.time() - 7 * 3600, time.time() - 7 * 3600))
+
+        assert sweep_stale_run_roots(str(tmp_path), "ldbrbench_") == 0
+        assert other.exists()
+
+    def test_missing_base_is_not_an_error(self, tmp_path: Path) -> None:
+        assert sweep_stale_run_roots(str(tmp_path / "nope"), "ldbrbench_") == 0
+
+
+class TestTierBudgets:
+    def test_every_tier_sets_a_case_timeout(self) -> None:
+        missing = [n for n, t in TIERS.items() if not t.case_timeout_s]
+        assert not missing, f"tiers with no per-case budget: {missing}"
+
+    def test_budgets_grow_with_tier_size(self) -> None:
+        """A budget that does not scale with the data is a false failure."""
+        ordered = ["smoke", "ci", "local", "full", "xl"]
+        budgets = [TIERS[n].case_timeout_s for n in ordered if n in TIERS]
+        assert budgets == sorted(budgets)
+
+
+class TestOverrides:
+    """``--blocks`` and ``--case-timeout`` exist to isolate one variable.
+
+    Block count turned out to matter more than data volume for the upsert
+    shuffle -- at a fixed 8M rows, 32 blocks took 155s, 64 took 530s and 256
+    did not finish -- and there was no way to vary it without editing a tier.
+    """
+
+    def test_blocks_defaults_to_the_tier(self) -> None:
+        run = BenchRun(RunConfig(tier="smoke"))
+        try:
+            assert run.blocks == TIERS["smoke"].blocks
+        finally:
+            run.cleanup()
+
+    def test_blocks_override_wins(self) -> None:
+        run = BenchRun(RunConfig(tier="smoke", blocks=97))
+        try:
+            assert run.blocks == 97
+        finally:
+            run.cleanup()
+
+    def test_case_timeout_defaults_to_the_tier(self) -> None:
+        run = BenchRun(RunConfig(tier="smoke"))
+        try:
+            assert run.case_timeout_s == TIERS["smoke"].case_timeout_s
+        finally:
+            run.cleanup()
+
+    @pytest.mark.parametrize("override", [0, 60.0])
+    def test_case_timeout_override_wins_including_zero(self, override: float) -> None:
+        """Zero must disable the budget, not fall back to the tier's."""
+        run = BenchRun(RunConfig(tier="smoke", case_timeout_s=override))
+        try:
+            assert run.case_timeout_s == override
+        finally:
+            run.cleanup()
