@@ -8,6 +8,7 @@ make benchmark                    # local tier, ~5 min
 make benchmark TIER=smoke         # ~80s, proves the suite itself works
 make benchmark TIER=ci            # what CI runs, ~2 min here
 make benchmark TIER=full          # opt-in, multi-GB
+make benchmark TIER=xl            # opt-in, 400M rows and hours
 make benchmark ARGS="--scenario read --repeat 5"
 make benchmark-compare            # diff against the committed baseline
 make benchmark-clean              # remove stray run directories
@@ -96,9 +97,17 @@ tier is smaller, not weaker.
 | `ci` | ~2 min | 250K narrow / 150K vector / 12K × 1536-dim |
 | `local` | ~5 min | 2M narrow / 1M vector |
 | `full` | minutes per scenario | 20M narrow / 8M vector |
+| `xl` | hours | 400M narrow / 64M vector / 3.2M × 1536-dim |
 
 The harness reads the machine's real CPU, RAM and free disk at startup and
 refuses a tier that will not fit, rather than trusting a spec sheet.
+
+`xl` scales the narrow dataset 20x past `full` but the vector datasets only 8x,
+because the vector shapes are what fill a disk. macOS caps Ray's object store at
+2GB, so `read_full`'s `materialize()` spills roughly a second copy of the table
+alongside the first, and `upsert_merge` holds one and a half; 8x peaks near 68GB
+and 20x would not fit a 128GB volume. It also runs one timed iteration instead of
+four, since at this size the point is scale rather than a stable median.
 
 ## Verified
 
@@ -124,6 +133,14 @@ A run leaves nothing behind, including when it is killed:
 
 - every directory lives under one run root, removed in a `finally`, and also
   registered with `atexit` and `SIGINT`/`SIGTERM`;
+- the `SIGTERM` handler is reinstalled after `ray.init`, which replaces it with
+  its own and silently drops whatever was there. Without that, a killed run
+  skipped cleanup entirely — one `xl` run left 39GB behind that way. Ray's
+  handler still runs; ours goes first, and again afterwards, because Ray's
+  processes write their session directory back on the way out;
+- a run sweeps stale run roots older than six hours at startup. Nothing catches
+  `SIGKILL`, and a process dying inside native code can abort before Python
+  regains control, so the in-process guarantees cannot be the only ones;
 - Ray's own temp directory is inside that root, and Ray is shut down alongside;
 - results go to `benchmarks/results/` (gitignored) or `BENCH_OUT_DIR`, never into
   the tracked tree;
@@ -131,6 +148,16 @@ A run leaves nothing behind, including when it is killed:
   `finally`, and sweep `bench_*` tables left by an earlier killed run;
 - CI asserts `git status --porcelain` is empty afterwards, so a leak fails the
   build rather than being discovered later.
+
+## Timeouts
+
+Every case runs under a per-tier wall-clock budget (`Tier.case_timeout_s`,
+overridable with `--case-timeout`; `0` disables it). A case that overruns is
+recorded as a failed case and the run moves on to the next one.
+
+This exists for the same reason `pyproject.toml` gives pytest `--timeout=300`: a
+LanceDB call can block in native code, and without a budget it takes the whole
+run with it rather than costing one case.
 
 ## In CI
 

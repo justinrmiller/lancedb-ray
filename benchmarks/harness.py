@@ -52,29 +52,137 @@ def _clean_all() -> None:
         _TO_CLEAN.discard(path)
 
 
+def _cleanup_signal_handler(signum: int, frame: Optional[FrameType]) -> None:
+    _clean_all()
+    # Restore and re-raise so the exit status still reflects the signal.
+    signal.signal(signum, signal.SIG_DFL)
+    os.kill(os.getpid(), signum)
+
+
 def _install_cleanup() -> None:
     """Make cleanup survive Ctrl-C and a CI cancellation, not just a clean exit."""
     global _cleanup_installed
     if _cleanup_installed:
         return
     atexit.register(_clean_all)
+    _install_signal_handlers()
+    _cleanup_installed = True
 
-    def handler(signum: int, frame: Optional[FrameType]) -> None:
-        _clean_all()
-        # Restore and re-raise so the exit status still reflects the signal.
-        signal.signal(signum, signal.SIG_DFL)
-        os.kill(os.getpid(), signum)
 
+def _install_signal_handlers() -> None:
     for sig in (signal.SIGINT, signal.SIGTERM):
         with contextlib.suppress(ValueError, OSError):
-            signal.signal(sig, handler)
-    _cleanup_installed = True
+            signal.signal(sig, _cleanup_signal_handler)
+
+
+def reinstall_signal_handlers() -> None:
+    """Take SIGTERM back from Ray.
+
+    ``ray.init`` installs its own SIGTERM handler and silently drops whatever
+    was there, so from that point a killed run skips cleanup entirely and
+    leaves its run root behind -- tens of GB at the larger tiers. Ray's handler
+    still runs; ours goes first. SIGINT is left alone, which Ray does not take.
+    """
+    if not _cleanup_installed:
+        return
+    current = signal.getsignal(signal.SIGTERM)
+    if current is _cleanup_signal_handler:
+        return
+
+    def chained(signum: int, frame: Optional[FrameType]) -> None:
+        # Twice on purpose: the first removes the bulk before Ray tears down,
+        # the second catches the session directory Ray's own processes write
+        # back into the run root on their way out. Anything they write after
+        # this process is gone is what the startup sweep is for.
+        _clean_all()
+        try:
+            if callable(current):
+                current(signum, frame)
+                return
+            signal.signal(signum, signal.SIG_DFL)
+            os.kill(os.getpid(), signum)
+        finally:
+            _clean_all()
+
+    with contextlib.suppress(ValueError, OSError):
+        signal.signal(signal.SIGTERM, chained)
+
+
+def sweep_stale_run_roots(base: str, prefix: str, max_age_s: float = 6 * 3600) -> int:
+    """Remove run roots an earlier run left behind.
+
+    No handler can catch SIGKILL, and a process that dies inside native code may
+    abort before Python regains control, so the in-process guarantees cannot be
+    the only ones. This is the same self-healing sweep the remote target already
+    does for stale tables, applied to local directories.
+    """
+    removed = 0
+    now = time.time()
+    with contextlib.suppress(OSError):
+        for name in os.listdir(base):
+            if not name.startswith(prefix):
+                continue
+            path = os.path.join(base, name)
+            if path in _TO_CLEAN:
+                continue
+            try:
+                if now - os.stat(path).st_mtime < max_age_s:
+                    continue
+            except OSError:
+                continue
+            shutil.rmtree(path, ignore_errors=True)
+            removed += 1
+    return removed
 
 
 def register_for_cleanup(path: str) -> str:
     _install_cleanup()
     _TO_CLEAN.add(path)
     return path
+
+
+class CaseTimeout(BaseException):
+    """A case exceeded its budget.
+
+    Deliberately not an ``Exception``. The alarm can land anywhere, including
+    inside ``lancedb_ray._retry.call_with_retry``, whose ``except Exception``
+    would treat the timeout as a transient failure and retry the very call that
+    was already overrunning. Deriving from ``BaseException`` makes it pass
+    through broad handlers the way ``KeyboardInterrupt`` does.
+    """
+
+
+@contextlib.contextmanager
+def case_deadline(seconds: Optional[float]) -> Iterator[None]:
+    """Fail a case that overruns instead of stalling the whole run.
+
+    pytest carries ``--timeout=300`` for the same reason the benchmark needs
+    this: a LanceDB call can block in native code and take the run with it. The
+    alarm interrupts the driver's wait, the scenario records an error, and the
+    remaining scenarios still get to run.
+
+    SIGALRM is main-thread and Unix-only; on anything else this is a no-op
+    rather than a false guarantee.
+    """
+    if not seconds or seconds <= 0 or not hasattr(signal, "SIGALRM"):
+        yield
+        return
+
+    def fire(signum: int, frame: Optional[FrameType]) -> None:
+        raise CaseTimeout(f"case exceeded its {seconds:.0f}s budget")
+
+    try:
+        previous = signal.signal(signal.SIGALRM, fire)
+    except ValueError:  # not the main thread
+        yield
+        return
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        with contextlib.suppress(ValueError, OSError):
+            signal.signal(signal.SIGALRM, previous)
 
 
 # -- tiers -------------------------------------------------------------------
@@ -93,6 +201,9 @@ class Tier:
     full_sweeps: bool
     #: Refuse to start if the run root has less free space than this.
     min_free_bytes: int
+    #: Per-case wall-clock budget. A case that overruns is recorded as an error
+    #: and the run continues; without it one stuck call stalls everything.
+    case_timeout_s: float
     description: str
 
     def rows_for(self, dataset: str) -> int:
@@ -116,6 +227,7 @@ TIERS: dict[str, Tier] = {
         warmup=0,
         full_sweeps=False,
         min_free_bytes=1 * _GB,
+        case_timeout_s=300,
         description="seconds; proves the suite itself works",
     ),
     "ci": Tier(
@@ -132,6 +244,7 @@ TIERS: dict[str, Tier] = {
         warmup=1,
         full_sweeps=False,
         min_free_bytes=3 * _GB,
+        case_timeout_s=600,
         description="sized for a 4-vCPU / 16GB hosted runner",
     ),
     "local": Tier(
@@ -148,6 +261,7 @@ TIERS: dict[str, Tier] = {
         warmup=1,
         full_sweeps=True,
         min_free_bytes=8 * _GB,
+        case_timeout_s=1_200,
         description="the default for a development machine",
     ),
     "full": Tier(
@@ -164,7 +278,36 @@ TIERS: dict[str, Tier] = {
         warmup=1,
         full_sweeps=True,
         min_free_bytes=60 * _GB,
+        case_timeout_s=3_600,
         description="opt-in; multi-GB and minutes per scenario",
+    ),
+    # Narrow scales 20x but the vector datasets stop at 8x, which is not a
+    # preference: macOS caps Ray's object store at 2GB, so read_full's
+    # materialize() spills roughly a second copy of the table to disk, and
+    # upsert_merge holds one and a half. At 20x vector that peaks past a 128GB
+    # volume; at 8x it peaks near 68GB.
+    "xl": Tier(
+        name="xl",
+        rows={
+            "narrow": 400_000_000,
+            "vector": 64_000_000,
+            "wide_vector": 3_200_000,
+            "wide_scalar": 40_000_000,
+            "fidelity": 1_000_000,
+        },
+        # Up from full's 32. Blocks are what Ray schedules, and at 32 a vector
+        # block would be ~1GB -- eight of them in flight is four times the whole
+        # object store. At 256 every dataset lands in a 50-133MB block.
+        blocks=256,
+        # This tier exists for scale, not for timing stability. Every check and
+        # every gated counter still runs; one timed iteration rather than four
+        # is what makes the run finish in hours instead of days.
+        repeat=1,
+        warmup=0,
+        full_sweeps=True,
+        min_free_bytes=80 * _GB,
+        case_timeout_s=5_400,
+        description="opt-in; 400M narrow rows and hours per run",
     ),
 }
 
@@ -180,6 +323,8 @@ class RunConfig:
     warmup: Optional[int] = None
     num_cpus: Optional[int] = None
     object_store_bytes: Optional[int] = None
+    case_timeout_s: Optional[float] = None
+    blocks: Optional[int] = None
     run_root: Optional[str] = None
     out_dir: Optional[str] = None
     baseline: Optional[str] = None
@@ -476,7 +621,7 @@ class Case:
         fixture: Any = None
         work = ""
 
-        with _ResourceSampler() as sampler:
+        with case_deadline(self.run.case_timeout_s), _ResourceSampler() as sampler:
             if not fresh:
                 work = self.workspace()
                 fixture = setup(work) if setup else None
@@ -616,6 +761,13 @@ class BenchRun:
             base = "/tmp" if sys.platform == "darwin" else None
             self.run_root = tempfile.mkdtemp(prefix="ldbrbench_", dir=base)
         register_for_cleanup(self.run_root)
+        # Whatever an earlier run failed to remove -- killed with SIGKILL, or
+        # aborted inside native code -- is reclaimed here rather than left to
+        # accumulate. Only roots older than the window, so a concurrent run's
+        # directory is never touched.
+        self.swept_run_roots = sweep_stale_run_roots(
+            os.path.dirname(self.run_root), "run_" if root else "ldbrbench_"
+        )
 
         self.probe_dir = os.path.join(self.run_root, "probe")
         os.makedirs(self.probe_dir, exist_ok=True)
@@ -628,7 +780,13 @@ class BenchRun:
 
     @property
     def blocks(self) -> int:
-        return self.tier.blocks
+        override = self.config.blocks
+        return self.tier.blocks if override is None else override
+
+    @property
+    def case_timeout_s(self) -> float:
+        override = self.config.case_timeout_s
+        return self.tier.case_timeout_s if override is None else override
 
     def storage_options(self) -> dict[str, str]:
         """Object-store options for the S3 target, read from the environment.
@@ -754,6 +912,8 @@ class BenchRun:
             _system_config=system_config or None,
         )
         self.ray_init_seconds = time.perf_counter() - start
+        # ray.init has just replaced our SIGTERM handler with its own.
+        reinstall_signal_handlers()
         self.environment["ray_num_cpus"] = num_cpus
         self.environment["ray_object_store_bytes"] = object_store
 
@@ -832,6 +992,14 @@ class BenchRun:
             json.dump(self.as_dict(), handle, indent=2, sort_keys=True)
 
     def cleanup(self) -> None:
+        # Twice, with a settle in between: ``ray.shutdown`` returns before its
+        # raylet and GCS children are gone, and on their way out they recreate
+        # ``<root>/ray/session_*/sockets`` underneath a root we have already
+        # removed. One retry is enough in practice; the startup sweep is what
+        # covers a child that outlives us entirely.
         shutil.rmtree(self.run_root, ignore_errors=True)
+        if os.path.exists(self.run_root):
+            time.sleep(0.5)
+            shutil.rmtree(self.run_root, ignore_errors=True)
         _TO_CLEAN.discard(self.run_root)
         os.environ.pop(PROBE_DIR_ENV, None)

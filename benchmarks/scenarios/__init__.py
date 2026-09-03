@@ -14,9 +14,14 @@ from typing import Optional
 
 from ..harness import BenchRun
 
-__all__ = ["REGISTRY", "Scenario", "all_scenarios", "register", "select"]
+__all__ = ["ALL_TIERS", "REGISTRY", "Scenario", "all_scenarios", "register", "select"]
 
 ScenarioFn = Callable[[BenchRun, str], None]
+
+#: Every tier a scenario runs in, which is currently all of them -- tiers change
+#: sizes, not coverage. Named once rather than spelled out per scenario so that
+#: adding a tier to ``harness.TIERS`` does not silently select nothing.
+ALL_TIERS: tuple[str, ...] = ("smoke", "ci", "local", "full", "xl")
 
 
 @dataclass(frozen=True)
@@ -29,8 +34,8 @@ class Scenario:
     #: ``fake`` is the in-repo Cloud/Enterprise stand-in, ``enterprise`` is a
     #: real service and never runs by default.
     backends: tuple[str, ...] = ("local", "fake")
-    #: Tiers the scenario participates in. Sweeps stay out of ``smoke``.
-    tiers: tuple[str, ...] = ("smoke", "ci", "local", "full")
+    #: Tiers the scenario participates in.
+    tiers: tuple[str, ...] = ALL_TIERS
 
 
 REGISTRY: dict[str, Scenario] = {}
@@ -42,7 +47,7 @@ def register(
     group: str,
     description: str,
     backends: tuple[str, ...] = ("local", "fake"),
-    tiers: tuple[str, ...] = ("smoke", "ci", "local", "full"),
+    tiers: tuple[str, ...] = ALL_TIERS,
 ) -> Callable[[ScenarioFn], ScenarioFn]:
     def decorate(fn: ScenarioFn) -> ScenarioFn:
         if name in REGISTRY:

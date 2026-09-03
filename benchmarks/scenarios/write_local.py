@@ -11,7 +11,7 @@ from ..harness import BenchRun
 
 if TYPE_CHECKING:
     from lancedb_ray.io import LocalWriteStrategy
-from . import register
+from . import ALL_TIERS, register
 from ._common import (
     TABLE,
     collect_counters,
@@ -124,7 +124,7 @@ def write_append(run: BenchRun, backend: str) -> None:
     group="write",
     description="Fragment path vs table-API path for the same local append",
     backends=("local",),
-    tiers=("smoke", "ci", "local", "full"),
+    tiers=ALL_TIERS,
 )
 def write_path_comparison(run: BenchRun, backend: str) -> None:
     """The comparison the README makes: one transaction per task, not per batch.
@@ -224,7 +224,7 @@ def write_overwrite(run: BenchRun, backend: str) -> None:
     "write_overwrite_empty",
     group="write",
     description="An empty overwrite must empty the table, not silently keep it",
-    tiers=("smoke", "ci", "local", "full"),
+    tiers=ALL_TIERS,
     backends=("local", "fake", "s3"),
 )
 def write_overwrite_empty(run: BenchRun, backend: str) -> None:

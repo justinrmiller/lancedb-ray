@@ -13,7 +13,7 @@ from typing import Any
 from .. import counters as counters_mod
 from .. import datagen
 from ..harness import BenchRun
-from . import register
+from . import ALL_TIERS, register
 from ._common import (
     TABLE,
     collect_counters,
@@ -37,7 +37,7 @@ def _api_kwargs(backend: str) -> dict[str, Any]:
     "knob_rows_per_transaction",
     group="knobs",
     description="Transaction size: the knob that sets a write task's peak memory",
-    tiers=("smoke", "ci", "local", "full"),
+    tiers=ALL_TIERS,
 )
 def knob_rows_per_transaction(run: BenchRun, backend: str) -> None:
     dataset = "vector"
@@ -101,7 +101,7 @@ def knob_rows_per_transaction(run: BenchRun, backend: str) -> None:
     "knob_max_bytes_per_request",
     group="knobs",
     description="The byte ceiling that bounds a wide schema's request payload",
-    tiers=("smoke", "ci", "local", "full"),
+    tiers=ALL_TIERS,
 )
 def knob_max_bytes_per_request(run: BenchRun, backend: str) -> None:
     """Rows are a poor proxy for size once a schema is wide.
@@ -169,7 +169,7 @@ def knob_max_bytes_per_request(run: BenchRun, backend: str) -> None:
     "knob_max_rows_per_request",
     group="knobs",
     description="The row ceiling splits one task into several transactions",
-    tiers=("smoke", "ci", "local", "full"),
+    tiers=ALL_TIERS,
 )
 def knob_max_rows_per_request(run: BenchRun, backend: str) -> None:
     dataset = "narrow"
@@ -217,7 +217,7 @@ def knob_max_rows_per_request(run: BenchRun, backend: str) -> None:
     group="knobs",
     description="How write throughput scales with concurrent tasks",
     backends=("local",),
-    tiers=("smoke", "ci", "local", "full"),
+    tiers=ALL_TIERS,
 )
 def knob_write_concurrency(run: BenchRun, backend: str) -> None:
     dataset = "vector"
@@ -257,7 +257,7 @@ def knob_write_concurrency(run: BenchRun, backend: str) -> None:
     group="knobs",
     description="max_rows_per_file sets the fragment count, and the read pays for it",
     backends=("local",),
-    tiers=("smoke", "ci", "local", "full"),
+    tiers=ALL_TIERS,
 )
 def knob_file_layout(run: BenchRun, backend: str) -> None:
     dataset = "vector"
@@ -332,7 +332,7 @@ def knob_file_layout(run: BenchRun, backend: str) -> None:
     group="knobs",
     description="Lance file format version: write cost, size, and read cost",
     backends=("local",),
-    tiers=("smoke", "ci", "local", "full"),
+    tiers=ALL_TIERS,
 )
 def knob_storage_version(run: BenchRun, backend: str) -> None:
     dataset = "vector"
@@ -374,7 +374,7 @@ def knob_storage_version(run: BenchRun, backend: str) -> None:
     group="knobs",
     description="What stable row IDs cost to write and to store",
     backends=("local",),
-    tiers=("smoke", "ci", "local", "full"),
+    tiers=ALL_TIERS,
 )
 def knob_stable_row_ids(run: BenchRun, backend: str) -> None:
     dataset = "vector"
@@ -418,7 +418,7 @@ def knob_stable_row_ids(run: BenchRun, backend: str) -> None:
     group="knobs",
     description="Lance scanner options on a local read",
     backends=("local",),
-    tiers=("smoke", "ci", "local", "full"),
+    tiers=ALL_TIERS,
 )
 def knob_scanner_options(run: BenchRun, backend: str) -> None:
     dataset = "wide_scalar"

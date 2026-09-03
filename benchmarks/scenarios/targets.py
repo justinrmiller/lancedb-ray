@@ -18,7 +18,7 @@ from typing import Any
 from .. import datagen
 from ..checks import id_stats, verify_id_space
 from ..harness import BenchRun
-from . import register
+from . import ALL_TIERS, register
 from ._common import expected_bytes
 
 
@@ -133,7 +133,7 @@ def _roundtrip(run: BenchRun, backend: str, label: str) -> None:
     group="targets",
     description="Write and read a real LanceDB Cloud/Enterprise table",
     backends=("enterprise",),
-    tiers=("smoke", "ci", "local", "full"),
+    tiers=ALL_TIERS,
 )
 def enterprise_roundtrip(run: BenchRun, backend: str) -> None:
     _roundtrip(run, backend, "enterprise")
@@ -144,7 +144,7 @@ def enterprise_roundtrip(run: BenchRun, backend: str) -> None:
     group="targets",
     description="Write and read against S3-compatible object storage",
     backends=("s3",),
-    tiers=("smoke", "ci", "local", "full"),
+    tiers=ALL_TIERS,
 )
 def objectstore_roundtrip(run: BenchRun, backend: str) -> None:
     """Where the Lance IO knobs finally matter.
