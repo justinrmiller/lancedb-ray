@@ -11,7 +11,7 @@ and expose the same surface either way.
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from enum import Enum
 from typing import Any, Literal, Optional, Union, cast
 
@@ -50,6 +50,16 @@ LocalWriteStrategy = Literal["auto", "fragment", "api"]
 
 #: Block count used to hash-partition an upsert when nothing better is known.
 _DEFAULT_UPSERT_PARTITIONS = 16
+
+#: Concurrent write tasks for a local upsert when the caller names none.
+_DEFAULT_LOCAL_UPSERT_CONCURRENCY = 4
+
+#: Shuffle fragments (source blocks x output partitions) past which the
+#: hash-partition starts to dominate the upsert. Measured on an 8M-row table
+#: against a 2GB object store: 1,024 fragments took 155-238s, 4,096 took 530s,
+#: 7,936 had not finished at 25 minutes and 65,536 not at 20. The threshold sits
+#: just above the last size that still behaved.
+_UPSERT_SHUFFLE_FRAGMENT_WARN = 4_096
 
 
 class _DatasetState(Enum):
@@ -364,12 +374,21 @@ def write_lancedb(
         mode: ``create``, ``append``, ``overwrite`` or ``upsert``.
         on: Key column(s) to match on. Required when ``mode="upsert"``.
         partition_on_keys: For upserts, hash-partition the input on ``on``
-            first so all rows for a key land in one write task. This costs a
-            shuffle. It changes nothing when the source's keys are already
-            unique -- a unique key can only occupy one block -- but when the
-            source repeats a key it turns silent cross-task duplication into
-            LanceDB's explicit ambiguous-merge error. Disable only when you
-            know the keys are unique and want to skip the shuffle.
+            first so all rows for a key land in one write task. It changes
+            nothing when the source's keys are already unique -- a unique key
+            can only occupy one block -- but when the source repeats a key it
+            turns silent cross-task duplication into LanceDB's explicit
+            ambiguous-merge error. Disable only when you know the keys are
+            unique and want to skip the shuffle.
+
+            The shuffle is not a constant cost. It produces one fragment per
+            (source block x output partition), so it grows with the product of
+            the two. The output partition count is chosen from
+            ``rows_per_transaction``, but the source's block count is yours: a
+            dataset split finely for write throughput makes the upsert shuffle
+            proportionally more expensive. On an 8M-row upsert, 1,024 fragments
+            took ~4 minutes and 65,536 had not finished after 20. A warning is
+            logged when the product looks large enough to dominate.
         schema: Schema used when creating the table. Defaults to the dataset's.
         transform_fn: Optional per-batch transform applied before writing.
             On the API path the sink applies it per batch; on the fragment path
@@ -445,13 +464,21 @@ def write_lancedb(
     _validate_concurrency(concurrency)
     normalized_on = validate_write_args(mode, on)
 
+    if concurrency is None and not spec.is_remote and mode == "upsert":
+        # Resolved here rather than at the write, because the hash partition
+        # below has to know how many writers it is feeding. Hash partitioning
+        # already rules out same-key races; this cap is purely about commit-lock
+        # contention on a single local dataset. Remote upserts have no such
+        # limit -- the service serialises for us.
+        concurrency = _DEFAULT_LOCAL_UPSERT_CONCURRENCY
+
     if mode == "upsert" and partition_on_keys and _can_race(concurrency):
         # Two tasks each holding one row for the same key will each find the
         # key absent and each insert it -- silently duplicating it, since
         # neither source is internally ambiguous. Hash-partitioning on the key
         # columns puts every row for a key in one task, where LanceDB rejects
         # the ambiguity outright instead. A loud error beats corrupt data.
-        ds = _hash_partition(ds, normalized_on, concurrency)
+        ds = _hash_partition(ds, normalized_on, concurrency, rows_per_transaction)
 
     use_fragment_path = _should_use_fragment_path(spec, mode, local_write_strategy)
 
@@ -479,12 +506,6 @@ def write_lancedb(
         data_storage_version=data_storage_version,
         enable_stable_row_ids=enable_stable_row_ids,
     )
-
-    if concurrency is None and not spec.is_remote and mode == "upsert":
-        # Hash partitioning already rules out same-key races; this cap is purely
-        # about commit-lock contention on a single local dataset. Remote upserts
-        # have no such limit -- the service serialises for us.
-        concurrency = 4
 
     datasink = LanceDBDatasink(
         spec,
@@ -573,8 +594,76 @@ def _require_hash_shuffle() -> None:
     )
 
 
+def _plan_statistic(fn: Callable[[], int]) -> Optional[int]:
+    try:
+        value = fn()
+    except Exception:  # noqa: BLE001 - a lazy plan cannot report this
+        return None
+    return value if isinstance(value, int) and value > 0 else None
+
+
+def _upsert_partition_count(
+    ds: Dataset, concurrency: Optional[int], rows_per_transaction: int
+) -> int:
+    """How many output partitions the key shuffle should produce.
+
+    Sized by the transaction budget, not by the source's block count. The two
+    are unrelated: block count is tuned for the *write* path, and a hash shuffle
+    costs source blocks x output partitions, so letting the output track the
+    input makes that product quadratic. Measured on an 8M-row upsert, varying
+    only the fan-out: 1,024 fragments took ~4 minutes, 4,096 ~9 minutes, and
+    65,536 had not finished after 20.
+
+    The floor is the write concurrency, because fewer partitions than writers
+    leaves writers idle. There is deliberately no ceiling at the source's block
+    count: a source of a few very large blocks needs to be split *finer* than
+    its input to keep transactions near the target.
+    """
+    floor = concurrency if concurrency and concurrency > 0 else 1
+
+    # ``num_blocks`` raises unless the plan has been executed, which makes it
+    # the test for whether ``count`` is free. On a lazy plan ``count`` does not
+    # raise -- it runs the source to find out, and the repartition below would
+    # then run it a second time -- so it is only ever called behind this gate.
+    rows = None
+    if _plan_statistic(ds.num_blocks) is not None:
+        rows = _plan_statistic(ds.count)
+
+    if rows and rows_per_transaction > 0:
+        # Enough partitions that a block lands near the transaction target.
+        # Ray bundles whole blocks and cannot split one, so a block larger than
+        # the target is an overshoot the write path cannot correct.
+        target = -(-rows // rows_per_transaction)  # ceil
+    else:
+        target = _DEFAULT_UPSERT_PARTITIONS
+
+    return max(1, floor, target)
+
+
+def _warn_if_shuffle_is_large(source_blocks: Optional[int], num_blocks: int) -> None:
+    """Say so when the shuffle, not the write, is about to dominate."""
+    if not source_blocks:
+        return
+    fragments = source_blocks * num_blocks
+    if fragments < _UPSERT_SHUFFLE_FRAGMENT_WARN:
+        return
+    logger.warning(
+        "upsert key shuffle will produce ~%d fragments (%d source blocks x %d "
+        "partitions) and is likely to dominate the write. Raise "
+        "rows_per_transaction to use fewer partitions, reduce the source's "
+        "block count, or pass partition_on_keys=False if the keys are already "
+        "unique.",
+        fragments,
+        source_blocks,
+        num_blocks,
+    )
+
+
 def _hash_partition(
-    ds: Dataset, keys: Optional[list[str]], concurrency: Optional[int]
+    ds: Dataset,
+    keys: Optional[list[str]],
+    concurrency: Optional[int],
+    rows_per_transaction: int,
 ) -> Dataset:
     """Co-locate every row sharing a key in the same block.
 
@@ -588,17 +677,8 @@ def _hash_partition(
 
     _require_hash_shuffle()
 
-    num_blocks = concurrency if concurrency and concurrency > 0 else None
-    if num_blocks is None:
-        try:
-            num_blocks = ds.num_blocks()
-        except Exception:  # noqa: BLE001 - lazy datasets cannot report this
-            # num_blocks() raises unless the dataset is materialised, and
-            # materialising just to count is not worth it. Ray will still
-            # hash-partition correctly with a nominal block count.
-            num_blocks = _DEFAULT_UPSERT_PARTITIONS
-    if not num_blocks or num_blocks < 1:
-        num_blocks = 1
+    num_blocks = _upsert_partition_count(ds, concurrency, rows_per_transaction)
+    _warn_if_shuffle_is_large(_plan_statistic(ds.num_blocks), num_blocks)
     return ds.repartition(num_blocks, keys=keys)
 
 

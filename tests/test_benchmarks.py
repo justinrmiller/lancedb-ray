@@ -238,3 +238,36 @@ class TestOverrides:
             assert run.case_timeout_s == override
         finally:
             run.cleanup()
+
+
+class TestCaseTimeoutIsNotSwallowed:
+    """The budget must survive the library's own error handling.
+
+    ``lancedb_ray._retry.call_with_retry`` catches ``Exception`` and retries.
+    An alarm landing inside it would have been read as a transient failure and
+    the overrunning call retried, so the timeout has to pass through the way
+    ``KeyboardInterrupt`` does.
+    """
+
+    def test_is_not_an_exception_subclass(self) -> None:
+        assert issubclass(CaseTimeout, BaseException)
+        assert not issubclass(CaseTimeout, Exception)
+
+    def test_a_broad_handler_does_not_catch_it(self) -> None:
+        caught = False
+        with contextlib.suppress(CaseTimeout):
+            try:
+                with case_deadline(0.05):
+                    time.sleep(5)
+            except Exception:  # noqa: BLE001 - the point of the test
+                caught = True
+        assert not caught, "an `except Exception` swallowed the budget"
+
+    def test_the_runner_names_it_so_a_timeout_is_recorded(self) -> None:
+        """A BaseException the runner did not name would end the whole run."""
+        import inspect
+
+        from benchmarks import __main__ as entry
+
+        src = inspect.getsource(entry.main)
+        assert "CaseTimeout" in src, "the runner must catch CaseTimeout explicitly"

@@ -19,7 +19,7 @@ import warnings
 from collections.abc import Sequence
 from typing import Optional
 
-from .harness import TIERS, BenchRun, RunConfig
+from .harness import TIERS, BenchRun, CaseTimeout, RunConfig
 from .report import (
     Comparison,
     compare_to_baseline,
@@ -210,7 +210,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     scenario.fn(run, backend)
                 except KeyboardInterrupt:
                     raise
-                except Exception as exc:
+                # CaseTimeout is a BaseException so that the library's own
+                # ``except Exception`` handlers cannot swallow it and retry the
+                # call that was already overrunning. It has to be named here for
+                # the same reason: it is a result, not an interruption.
+                except (CaseTimeout, Exception) as exc:  # noqa: B014
                     _record_scenario_error(run, scenario.name, backend, exc)
                     if config.fail_fast:
                         break

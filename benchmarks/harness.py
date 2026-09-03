@@ -141,8 +141,15 @@ def register_for_cleanup(path: str) -> str:
     return path
 
 
-class CaseTimeout(RuntimeError):
-    """A case exceeded its budget."""
+class CaseTimeout(BaseException):
+    """A case exceeded its budget.
+
+    Deliberately not an ``Exception``. The alarm can land anywhere, including
+    inside ``lancedb_ray._retry.call_with_retry``, whose ``except Exception``
+    would treat the timeout as a transient failure and retry the very call that
+    was already overrunning. Deriving from ``BaseException`` makes it pass
+    through broad handlers the way ``KeyboardInterrupt`` does.
+    """
 
 
 @contextlib.contextmanager
