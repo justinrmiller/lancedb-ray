@@ -39,6 +39,10 @@ dev = [
     "mypy>=1.11.0",
     "ruff>=0.8.0",
     "pandas>=2.0.0",
+    # The MCAP example is tested in CI, unlike the examples whose dependencies
+    # are model-sized. mcap is pure Python and pulls in only its compression
+    # codecs, so it is cheap enough to keep in the dev environment.
+    "mcap>=1.2.0",
 ]
 
 [project.urls]
@@ -52,7 +56,10 @@ include = ["lancedb_ray*"]
 [tool.ruff]
 line-length = 88
 target-version = "py312"
-src = ["lancedb_ray", "tests", "examples", "benchmarks"]
+# examples/mcap_ingest is named directly as well as via examples/: its modules
+# are imported flat (the way a Ray worker loads them), so isort only sees them
+# as first-party if the directory itself is a source root.
+src = ["lancedb_ray", "tests", "examples", "examples/mcap_ingest", "benchmarks"]
 
 [tool.ruff.lint]
 select = ["E", "W", "F", "I", "B", "UP", "SIM"]
@@ -65,6 +72,10 @@ quote-style = "double"
 testpaths = ["tests"]
 addopts = [
     "--cov=lancedb_ray",
+    # The MCAP example is covered like library code, because it is library-
+    # shaped: people copy it. The other examples need models or credentials to
+    # run at all, so they stay outside the gate.
+    "--cov=examples/mcap_ingest",
     "--cov-report=term-missing",
     # Set just below where the suite actually sits, so a real
     # regression trips it but ordinary churn does not.
@@ -80,13 +91,18 @@ markers = [
 ]
 
 [tool.coverage.run]
-source = ["lancedb_ray"]
+source = ["lancedb_ray", "examples/mcap_ingest"]
 # The benchmark suite is tooling, exercised by being run rather than by the
 # unit tests, so it is not part of the coverage gate.
 omit = ["*/tests/*", "*/benchmarks/*"]
 # Line coverage alone hides half-tested conditionals: a branch whose true arm
 # runs and whose false arm never does still counts every line as covered.
 branch = true
+
+[tool.coverage.report]
+# A module's CLI entry point is exercised by calling main() directly; the
+# guard itself only runs under ``python file.py``.
+exclude_also = ['if __name__ == "__main__":']
 
 [tool.mypy]
 # No python_version pin: it must match the interpreter actually running mypy,
@@ -98,9 +114,24 @@ files = ["lancedb_ray", "tests", "examples", "benchmarks"]
 # search path. Example module names are kept globally unique to match.
 # ``benchmarks`` reuses the test suite's fake Cloud/Enterprise backend, which is
 # imported flat (``_fakes``) because Ray workers load it that way.
-mypy_path = ["tests", "examples/clip_image_search", "examples/vllm_generate_embed"]
+mypy_path = [
+    "tests",
+    "examples/clip_image_search",
+    "examples/mcap_ingest",
+    "examples/vllm_generate_embed",
+]
 strict = true
 warn_unused_ignores = false
+
+# mcap's writer does ``from .__init__ import __version__``, which makes mypy
+# see mcap/__init__.py under two module names and refuse to build anything at
+# all. Skipping the package sidesteps its packaging bug; it also means mcap's
+# API arrives as Any, which is how every other untyped dependency here is
+# already treated.
+[[tool.mypy.overrides]]
+module = ["mcap.*"]
+follow_imports = "skip"
+ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = [

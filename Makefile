@@ -10,6 +10,7 @@ help:
 	@echo "  lint        Run ruff check, ruff format --check and mypy"
 	@echo "  fix         Auto-fix lint issues and format code"
 	@echo "  example     Run the end-to-end quickstart example"
+	@echo "  example-mcap  Generate sample MCAP logs and index them into LanceDB"
 	@echo "  benchmark   Run the benchmark suite (TIER=smoke|ci|local|full)"
 	@echo "  benchmark-compare   Run and diff against the committed baseline"
 	@echo "  benchmark-baseline  Rewrite the baseline for this tier (deliberate)"
@@ -47,7 +48,16 @@ fix:
 
 .PHONY: example
 example:
-	uv run python examples/quickstart.py
+	uv run python examples/quickstart/quickstart.py
+
+# Generates synthetic recordings under a temp directory, then indexes them.
+.PHONY: example-mcap
+example-mcap:
+	uv run python examples/mcap_ingest/make_sample_mcap.py --out $${MCAP_LOGS:-/tmp/ldbr_mcap_logs}
+	uv run python examples/mcap_ingest/ingest_mcap.py \
+		--logs $${MCAP_LOGS:-/tmp/ldbr_mcap_logs} \
+		--uri $${MCAP_DB:-/tmp/ldbr_mcap_db} \
+		--mode overwrite
 
 # Tier sizes the run; every correctness check runs in every tier. ARGS is
 # passed through, e.g. ARGS="--scenario read --repeat 5".
@@ -96,3 +106,4 @@ clean:
 	find . -type d -name htmlcov -exec rm -rf {} +
 	rm -rf benchmarks/results
 	rm -rf /tmp/ldbrbench_*
+	rm -rf /tmp/ldbr_mcap_logs /tmp/ldbr_mcap_db
