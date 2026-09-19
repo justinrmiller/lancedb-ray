@@ -53,10 +53,14 @@ and all Cloud/Enterprise writes go through LanceDB's table API with batching and
 
 ## Install
 
-Not published to PyPI. Install from the repository:
+```bash
+uv pip install lancedb-ray
+```
+
+Or the unreleased tip of `main`:
 
 ```bash
-uv pip install git+ssh://git@github.com/justinrmiller/lancedb-ray.git
+uv pip install git+https://github.com/justinrmiller/lancedb-ray.git
 ```
 
 Or for local development:
@@ -263,6 +267,11 @@ service:
 ```bash
 LANCEDB_URI=db://your-db LANCEDB_API_KEY=... pytest -m enterprise
 ```
+
+Commit messages follow [Conventional Commits](https://www.conventionalcommits.org/):
+`fix:` cuts a patch release, `feat:` a minor one, and the version in
+`pyproject.toml` is written by automation rather than by hand. See
+[RELEASING.md](RELEASING.md).
 
 ## License
 

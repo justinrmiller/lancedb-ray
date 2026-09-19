@@ -1,0 +1,7 @@
+# setuptools' default sdist rules sweep in ``tests/test_*.py`` but not the
+# conftest and fakes they import, which ships a test suite that cannot run.
+# Keep the sdist to the library itself.
+prune tests
+prune benchmarks
+prune examples
+global-exclude *.py[cod] __pycache__

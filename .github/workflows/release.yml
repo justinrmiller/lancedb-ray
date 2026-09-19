@@ -1,0 +1,77 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+# Read-only by default; every job asks for exactly the scopes it needs.
+permissions: {}
+
+# Never let two releases interleave, and never cancel one mid-flight: a
+# half-finished release leaves a tag with nothing on PyPI behind it.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  # Keeps a release PR open that bumps the version and rewrites CHANGELOG.md
+  # from the Conventional Commits landed since the last tag. Merging that PR
+  # is the release: this job then tags the merge commit and cuts the GitHub
+  # release, and the jobs below publish it.
+  release-please:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: release
+        with:
+          config-file: .release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  # A PyPI upload cannot be replaced or re-cut, so "CI was green on the
+  # release PR" is not enough: run the whole suite again on the tagged commit.
+  verify:
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    needs: [release-please, verify]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/lancedb-ray
+    permissions:
+      # PyPI Trusted Publishing mints a short-lived OIDC token per run, so
+      # there is no long-lived API token to store or rotate.
+      id-token: write
+      # Attaching the built artifacts to the GitHub release.
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release-please.outputs.tag_name }}
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Build sdist and wheel
+        run: uv build
+      - name: Check the distribution metadata
+        run: uvx twine check --strict dist/*
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+      - name: Attach the artifacts to the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # checkout ran with persist-credentials: false, so gh cannot infer
+          # the repository from the remote.
+          GH_REPO: ${{ github.repository }}
+        run: gh release upload "${{ needs.release-please.outputs.tag_name }}" dist/* --clobber

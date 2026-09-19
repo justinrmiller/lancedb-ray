@@ -1,10 +1,16 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+# 77 is the floor for PEP 639: below it, the SPDX ``license`` string and
+# ``license-files`` below are either rejected or silently reinterpreted as the
+# legacy free-text field, so the published metadata would depend on whatever
+# setuptools the build environment happened to resolve.
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "lancedb-ray"
-version = "0.1.0"
+# Managed by release-please: the release PR rewrites this line and the
+# matching entry in .release-please-manifest.json. Do not bump it by hand.
+version = "0.0.0"
 description = "Ray Data integration for LanceDB and LanceDB Enterprise"
 readme = "README.md"
 requires-python = ">=3.12"
