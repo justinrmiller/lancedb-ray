@@ -76,6 +76,9 @@ quote-style = "double"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# tests/test_benchmarks.py imports the benchmark suite, which lives at the repo
+# root and is not part of the installed package.
+pythonpath = ["."]
 addopts = [
     "--cov=lancedb_ray",
     "--cov-report=term-missing",

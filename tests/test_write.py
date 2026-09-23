@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 import lance
@@ -570,6 +571,93 @@ class TestUpsertShuffleAvoidance:
             io_mod._hash_partition = original  # type: ignore[assignment]
 
 
+class TestUpsertPartitionCount:
+    """The shuffle's fan-out must follow the transaction budget, not the input.
+
+    A hash shuffle costs one fragment per (source block x output partition).
+    Sizing the output from ``ds.num_blocks()`` made that product quadratic, so a
+    dataset split finely for write throughput paid for it again on every upsert:
+    at a fixed 8M rows, 1,024 fragments took ~4 minutes and 65,536 had not
+    finished after 20.
+    """
+
+    def test_output_follows_rows_per_transaction_not_block_count(self) -> None:
+        from lancedb_ray.io import _upsert_partition_count
+
+        ds = dataset_of(make_table(1000), blocks=50).materialize()
+        # 1000 rows at 100 per transaction wants 10 partitions, whatever the
+        # source's own block count happens to be.
+        assert _upsert_partition_count(ds, 4, 100) == 10
+
+    def test_block_count_does_not_change_the_answer(self) -> None:
+        """The regression: fan-out used to track the source's blocking."""
+        from lancedb_ray.io import _upsert_partition_count
+
+        coarse = dataset_of(make_table(1000), blocks=2).materialize()
+        fine = dataset_of(make_table(1000), blocks=50).materialize()
+        assert _upsert_partition_count(coarse, 4, 100) == _upsert_partition_count(
+            fine, 4, 100
+        )
+
+    def test_a_coarse_source_is_split_finer_than_its_input(self) -> None:
+        """A few huge blocks must still yield transaction-sized partitions."""
+        from lancedb_ray.io import _upsert_partition_count
+
+        ds = dataset_of(make_table(1000), blocks=2).materialize()
+        assert _upsert_partition_count(ds, 1, 10) == 100
+
+    def test_never_fewer_partitions_than_writers(self) -> None:
+        """Fewer partitions than concurrent writers leaves writers idle."""
+        from lancedb_ray.io import _upsert_partition_count
+
+        ds = dataset_of(make_table(100), blocks=8).materialize()
+        assert _upsert_partition_count(ds, 8, 10_000) == 8
+
+    @pytest.mark.parametrize("concurrency", [None, 0, -1])
+    def test_absent_concurrency_still_yields_a_valid_count(
+        self, concurrency: object
+    ) -> None:
+        from lancedb_ray.io import _upsert_partition_count
+
+        ds = dataset_of(make_table(100), blocks=4).materialize()
+        assert _upsert_partition_count(ds, concurrency, 10_000) >= 1  # type: ignore[arg-type]
+
+    def test_a_lazy_plan_is_never_counted(self) -> None:
+        """Counting a lazy plan runs the source, which the repartition repeats."""
+        from lancedb_ray.io import _DEFAULT_UPSERT_PARTITIONS, _upsert_partition_count
+
+        counted = []
+
+        class Lazy:
+            def num_blocks(self) -> int:
+                raise RuntimeError("plan not executed")
+
+            def count(self) -> int:
+                counted.append(1)  # pragma: no cover - must not be reached
+                return 10_000_000
+
+        got = _upsert_partition_count(Lazy(), 1, 256 * 1024)  # type: ignore[arg-type]
+        assert got == _DEFAULT_UPSERT_PARTITIONS
+        assert not counted, "count() must stay behind the num_blocks gate"
+
+    def test_large_fan_out_is_warned_about(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from lancedb_ray.io import _warn_if_shuffle_is_large
+
+        with caplog.at_level(logging.WARNING, logger="lancedb_ray.io"):
+            _warn_if_shuffle_is_large(256, 256)
+        assert "shuffle" in caplog.text
+        assert "rows_per_transaction" in caplog.text
+
+    def test_a_modest_fan_out_is_silent(self, caplog: pytest.LogCaptureFixture) -> None:
+        from lancedb_ray.io import _warn_if_shuffle_is_large
+
+        with caplog.at_level(logging.WARNING, logger="lancedb_ray.io"):
+            _warn_if_shuffle_is_large(16, 16)
+        assert not caplog.text
+
+
 class TestHashPartitionEdges:
     """``_hash_partition`` guards upserts; its degenerate inputs still matter."""
 
@@ -577,8 +665,8 @@ class TestHashPartitionEdges:
         from lancedb_ray.io import _hash_partition
 
         ds = dataset_of(make_table(10))
-        assert _hash_partition(ds, None, 4) is ds
-        assert _hash_partition(ds, [], 4) is ds
+        assert _hash_partition(ds, None, 4, 256 * 1024) is ds
+        assert _hash_partition(ds, [], 4, 256 * 1024) is ds
 
     @pytest.mark.parametrize("concurrency", [0, -1])
     def test_non_positive_concurrency_falls_back_to_a_valid_block_count(
@@ -587,7 +675,9 @@ class TestHashPartitionEdges:
         """Ray rejects a repartition into zero blocks, so it must be clamped."""
         from lancedb_ray.io import _hash_partition
 
-        partitioned = _hash_partition(dataset_of(make_table(20)), ["id"], concurrency)
+        partitioned = _hash_partition(
+            dataset_of(make_table(20)), ["id"], concurrency, 256 * 1024
+        )
         assert partitioned.materialize().count() == 20
 
     def test_a_lazy_dataset_still_partitions(self) -> None:
@@ -595,7 +685,7 @@ class TestHashPartitionEdges:
         from lancedb_ray.io import _hash_partition
 
         lazy = dataset_of(make_table(30)).map_batches(lambda b: b)
-        partitioned = _hash_partition(lazy, ["id"], None)
+        partitioned = _hash_partition(lazy, ["id"], None, 256 * 1024)
         assert partitioned.materialize().count() == 30
 
 
