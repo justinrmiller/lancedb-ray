@@ -17,6 +17,9 @@ Example:
     >>> ldbr.write_lancedb(ds, "copy", uri="/data/lancedb", mode="create")  # doctest: +SKIP
 """
 
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _dist_version
+
 from ._plan import OffsetRange
 from ._retry import RetryPolicy
 from .connection import LanceDBConnectionSpec
@@ -24,7 +27,12 @@ from .datasink import LanceDBDatasink, WriteStats
 from .datasource import LanceDBDatasource
 from .io import read_lancedb, write_lancedb
 
-__version__ = "0.1.0"
+# Read from the installed distribution rather than hard-coded here, so the
+# version release-please writes into pyproject.toml is the only one there is.
+try:
+    __version__ = _dist_version("lancedb-ray")
+except PackageNotFoundError:  # pragma: no cover - only in an uninstalled tree
+    __version__ = "0.0.0.dev0"
 
 __all__ = [
     "LanceDBConnectionSpec",

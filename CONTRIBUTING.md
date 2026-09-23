@@ -15,7 +15,11 @@ make lint    # ruff check + format check + mypy (strict)
 make fix     # auto-fix and format
 ```
 
-All three must pass before a PR merges. CI runs the suite on Python 3.12.
+All three must pass before a PR merges. CI runs the suite on Python 3.12 twice:
+once against the newest Ray, and once (`test-ray-floor`) against the oldest Ray
+`pyproject.toml` allows. Code that only works on a newer Ray has to either keep
+the floor passing or raise the floor on purpose, with the reason in the
+comment beside it.
 
 ## Testing against both backends
 
@@ -41,6 +45,26 @@ LANCEDB_URI=db://your-db LANCEDB_API_KEY=... pytest -m enterprise
 ```
 
 These create uniquely-named tables and drop them afterwards.
+
+## Commit messages
+
+Commits on `main` drive the version number, so they follow
+[Conventional Commits](https://www.conventionalcommits.org/):
+
+```
+fix: match HTTP status codes as whole numbers
+feat: expose a batch_size knob on the local read path
+feat!: drop the deprecated positional uri argument
+```
+
+`fix:` produces a patch release, `feat:` a minor one, and a `!` or a
+`BREAKING CHANGE:` footer marks a breaking change. `test:`, `style:`, `ci:`,
+`build:` and `chore:` produce a patch release too, but are kept out of the
+changelog. PRs are squash-merged, so it is the **PR title** that has to be
+conventional.
+
+Do not edit `version` in `pyproject.toml` or `CHANGELOG.md`; release-please owns
+both. [RELEASING.md](RELEASING.md) has the full process.
 
 ## Guidelines
 

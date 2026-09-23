@@ -16,6 +16,7 @@ help:
 	@echo "  benchmark-enterprise Run the opt-in live Enterprise target"
 	@echo "  benchmark-s3         Run the opt-in object-storage target"
 	@echo "  benchmark-clean      Remove stray benchmark run directories"
+	@echo "  dist        Build the sdist and wheel and check their metadata"
 	@echo "  clean       Remove build artifacts and caches"
 
 .PHONY: build
@@ -84,6 +85,14 @@ benchmark-clean:
 	rm -rf benchmarks/results
 	rm -rf /tmp/ldbrbench_* $${BENCH_RUN_ROOT:-/nonexistent}/run_*
 	@echo "removed benchmark run directories and results"
+
+# Versions are written by release-please, so this builds whatever is in
+# pyproject.toml right now; between releases that is the placeholder 0.0.0.
+.PHONY: dist
+dist:
+	rm -rf dist/
+	uv build
+	uvx twine check --strict dist/*
 
 .PHONY: clean
 clean:
