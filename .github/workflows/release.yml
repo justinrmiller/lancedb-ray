@@ -66,6 +66,19 @@ jobs:
         run: uv build
       - name: Check the distribution metadata
         run: uvx twine check --strict dist/*
+      # If a bad merge ever dropped release-please's edit to pyproject.toml,
+      # this would otherwise upload the 0.0.0 placeholder under the vX.Y.Z tag
+      # and burn that version number on PyPI permanently.
+      - name: Check the built version matches the tag
+        env:
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+        run: |
+          built="$(basename dist/*.whl | cut -d- -f2)"
+          if [ "$built" != "${TAG#v}" ]; then
+            echo "tag $TAG carries version ${TAG#v}, but the build produced $built"
+            exit 1
+          fi
+          echo "built $built from $TAG"
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
       - name: Attach the artifacts to the GitHub release
