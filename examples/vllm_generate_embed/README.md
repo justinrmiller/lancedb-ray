@@ -45,14 +45,17 @@ uv pip install -r examples/vllm_generate_embed/requirements.txt
 For the vLLM path, additionally:
 
 ```bash
-uv pip install "ray[llm]" vllm
+uv pip install "ray[llm]>=2.53" vllm
 ```
 
 **Two version constraints matter here**, both discovered by running it:
 
-`ray` is pinned to exactly 2.58.0. `ray.data.llm` renamed
-`build_llm_processor` to `build_processor` between releases, so an environment
-that drifts to 2.50 fails at import.
+`ray` must be **2.53 or newer**. The example calls
+`ray.data.llm.build_processor`, which 2.53 introduced (2.56 then removed the old
+`build_llm_processor` name), so an environment on 2.50 fails at import. The
+library needs 2.53 too, for an unrelated reason, so installing it already
+satisfies this; the explicit floor keeps the example correct if the library's
+ever drops below it.
 
 `transformers` must be **below 5** when using the vLLM engine. vLLM 0.11 calls
 `tokenizer.all_special_tokens_extended`, which transformers 5 removed, and the

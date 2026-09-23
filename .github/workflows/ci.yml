@@ -5,6 +5,15 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # The release workflow re-runs this whole suite against the tagged commit
+  # before anything is uploaded to PyPI.
+  workflow_call:
+    inputs:
+      ref:
+        description: Commit, branch or tag to test. Empty means the event's own.
+        type: string
+        required: false
+        default: ""
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -20,6 +29,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
@@ -44,6 +55,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
@@ -57,6 +70,78 @@ jobs:
         # Live Enterprise tests skip automatically without credentials.
         run: pytest -v
 
+  # The job above resolves the newest Ray, so on its own it never tests the
+  # oldest one pyproject.toml claims to support. A Ray client must match its
+  # cluster's version, so users on older clusters install that floor, and it
+  # has to keep working. The floor is read from pyproject.toml rather than
+  # repeated here, so moving it moves what this job tests.
+  test-ray-floor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Create environment
+        run: |
+          uv venv --python 3.12
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+      - name: Install at the Ray floor
+        run: |
+          floor="$(python - <<'PY'
+          import re
+          import tomllib
+
+          with open("pyproject.toml", "rb") as f:
+              deps = tomllib.load(f)["project"]["dependencies"]
+          (ray,) = [d for d in deps if re.match(r"ray\b", d)]
+          match = re.search(r">=\s*([0-9][0-9.]*)", ray)
+          if match is None:
+              raise SystemExit(f"no >= floor in the ray requirement: {ray!r}")
+          print(match.group(1))
+          PY
+          )"
+          echo "Ray floor from pyproject.toml: $floor"
+          uv pip install -e ".[dev]" "ray[data]==$floor"
+          python -c "import ray; assert ray.__version__ == '$floor', ray.__version__"
+      - name: Test
+        run: pytest -v
+
+  # Packaging breaks quietly: a missing file or bad metadata only shows up at
+  # upload time, when the version number has already been burned. Build the
+  # real artifacts on every change instead.
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Build sdist and wheel
+        run: uv build
+      - name: Check the distribution metadata
+        run: uvx twine check --strict dist/*
+      # --no-deps keeps this to seconds: the point is the artifact, not Ray.
+      # It proves the wheel installs, that its distribution name resolves
+      # (which is where __version__ comes from), and that py.typed shipped —
+      # without the marker every downstream type checker silently ignores us.
+      - name: Install the built wheel and check what it shipped
+        run: |
+          uv venv --python 3.12 /tmp/wheel-check
+          VIRTUAL_ENV=/tmp/wheel-check uv pip install --no-deps dist/*.whl
+          /tmp/wheel-check/bin/python - <<'PY'
+          from importlib.metadata import files, version
+
+          print(version("lancedb-ray"))
+          shipped = {f.name for f in files("lancedb-ray") or ()}
+          assert "py.typed" in shipped, "the wheel is missing py.typed"
+          PY
+
   benchmark:
     runs-on: ubuntu-latest
     # The ci tier budgets ~8 minutes of work; this is the backstop for a
@@ -64,6 +149,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true

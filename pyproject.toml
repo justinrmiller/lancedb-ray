@@ -1,9 +1,15 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+# 77 is the floor for PEP 639: below it, the SPDX ``license`` string and
+# ``license-files`` below are either rejected or silently reinterpreted as the
+# legacy free-text field, so the published metadata would depend on whatever
+# setuptools the build environment happened to resolve.
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "lancedb-ray"
+# Managed by release-please: the release PR rewrites this line and the
+# matching entry in .release-please-manifest.json. Do not bump it by hand.
 version = "0.1.0"
 description = "Ray Data integration for LanceDB and LanceDB Enterprise"
 readme = "README.md"
@@ -21,10 +27,17 @@ classifiers = [
 ]
 
 dependencies = [
-    # Pinned exactly: ray.data.llm renamed build_llm_processor to
-    # build_processor between releases, so the LLM example is tied to one
-    # version. A floor let the environment drift to 2.50 and break it.
-    "ray[data]==2.58.0",
+    # The floor is the oldest Ray the whole test suite passes on; the
+    # test-ray-floor CI job installs exactly this version to keep it true.
+    # 2.53 is the first Ray to pass the dataset's schema to
+    # Datasink.on_write_start. On 2.52, a write that has to create the table
+    # fails unless the caller passes schema= (every Cloud/Enterprise create,
+    # and some local ones); older releases also break upserts and projection.
+    # No upper bound: a Ray client must match its cluster's version, so a cap
+    # or an exact pin would make this uninstallable alongside most clusters.
+    # The vLLM example also needs 2.53, for a different reason; its README
+    # covers that.
+    "ray[data]>=2.53.0",
     "lancedb>=0.24.0",
     "lance-ray>=0.5.0",
     "pyarrow>=17.0.0",
