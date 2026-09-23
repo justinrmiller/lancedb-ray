@@ -70,6 +70,46 @@ jobs:
         # Live Enterprise tests skip automatically without credentials.
         run: pytest -v
 
+  # The job above resolves the newest Ray, so on its own it never tests the
+  # oldest one pyproject.toml claims to support. A Ray client must match its
+  # cluster's version, so users on older clusters install that floor, and it
+  # has to keep working. The floor is read from pyproject.toml rather than
+  # repeated here, so moving it moves what this job tests.
+  test-ray-floor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Create environment
+        run: |
+          uv venv --python 3.12
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+      - name: Install at the Ray floor
+        run: |
+          floor="$(python - <<'PY'
+          import re
+          import tomllib
+
+          with open("pyproject.toml", "rb") as f:
+              deps = tomllib.load(f)["project"]["dependencies"]
+          (ray,) = [d for d in deps if re.match(r"ray\b", d)]
+          match = re.search(r">=\s*([0-9][0-9.]*)", ray)
+          if match is None:
+              raise SystemExit(f"no >= floor in the ray requirement: {ray!r}")
+          print(match.group(1))
+          PY
+          )"
+          echo "Ray floor from pyproject.toml: $floor"
+          uv pip install -e ".[dev]" "ray[data]==$floor"
+          python -c "import ray; assert ray.__version__ == '$floor', ray.__version__"
+      - name: Test
+        run: pytest -v
+
   # Packaging breaks quietly: a missing file or bad metadata only shows up at
   # upload time, when the version number has already been burned. Build the
   # real artifacts on every change instead.

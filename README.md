@@ -72,7 +72,9 @@ uv venv --python 3.12
 make build
 ```
 
-Requires Python 3.12 or newer. CI tests against 3.12.
+Requires Python 3.12 or newer and Ray 2.53 or newer. CI tests Python 3.12
+against both the newest Ray and the oldest supported one, so an install next to
+an older Ray cluster is tested, not assumed.
 
 ## API
 

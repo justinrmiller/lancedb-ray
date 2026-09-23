@@ -27,10 +27,17 @@ classifiers = [
 ]
 
 dependencies = [
-    # Pinned exactly: ray.data.llm renamed build_llm_processor to
-    # build_processor between releases, so the LLM example is tied to one
-    # version. A floor let the environment drift to 2.50 and break it.
-    "ray[data]==2.58.0",
+    # The floor is the oldest Ray the whole test suite passes on; the
+    # test-ray-floor CI job installs exactly this version to keep it true.
+    # 2.53 is the first Ray to pass the dataset's schema to
+    # Datasink.on_write_start. On 2.52, a write that has to create the table
+    # fails unless the caller passes schema= (every Cloud/Enterprise create,
+    # and some local ones); older releases also break upserts and projection.
+    # No upper bound: a Ray client must match its cluster's version, so a cap
+    # or an exact pin would make this uninstallable alongside most clusters.
+    # The vLLM example also needs 2.53, for a different reason; its README
+    # covers that.
+    "ray[data]>=2.53.0",
     "lancedb>=0.24.0",
     "lance-ray>=0.5.0",
     "pyarrow>=17.0.0",

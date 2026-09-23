@@ -15,7 +15,11 @@ make lint    # ruff check + format check + mypy (strict)
 make fix     # auto-fix and format
 ```
 
-All three must pass before a PR merges. CI runs the suite on Python 3.12.
+All three must pass before a PR merges. CI runs the suite on Python 3.12 twice:
+once against the newest Ray, and once (`test-ray-floor`) against the oldest Ray
+`pyproject.toml` allows. Code that only works on a newer Ray has to either keep
+the floor passing or raise the floor on purpose, with the reason in the
+comment beside it.
 
 ## Testing against both backends
 
