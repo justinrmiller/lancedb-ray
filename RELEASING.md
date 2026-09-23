@@ -4,8 +4,8 @@ Versions are derived from commit messages. Nobody edits a version number by hand
 
 - [How a release happens](#how-a-release-happens)
 - [What each commit type does to the version](#what-each-commit-type-does-to-the-version)
+- [Cutting a release](#cutting-a-release)
 - [First-time setup](#first-time-setup)
-- [Cutting the first release](#cutting-the-first-release)
 - [Rehearsing against TestPyPI](#rehearsing-against-testpypi)
 - [When something goes wrong](#when-something-goes-wrong)
 
@@ -55,14 +55,14 @@ to a GitHub App token so its PRs get CI like any other.
 | `feat: …` | minor (`0.3.1` → `0.4.0`) | Features |
 | `perf:`, `refactor:`, `docs:`, `deps:`, `revert:` | patch | own section |
 | `feat!: …`, or a `BREAKING CHANGE:` footer | minor while below 1.0.0, major after | ⚠ BREAKING CHANGES |
-| `test:`, `style:`, `ci:`, `build:`, `chore:` | patch | hidden |
+| `test:`, `style:`, `ci:`, `build:`, `chore:` | none on their own | hidden |
 
-Note the last row: release-please bumps a patch for *any* conventional commit it
-can parse, and `hidden` only keeps it out of the changelog body. A week of
-`chore:` and `ci:` commits will still open a release PR — just an empty-looking
-one. Close it, or merge it and spend the patch number; it reopens on the next
-push either way. Only a commit release-please cannot parse as conventional is
-ignored outright.
+Note the last row. release-please skips a release whose notes would be empty, so
+the hidden types never open a release PR by themselves: a week of `chore:` and
+`ci:` commits leaves no PR behind, and they ship with the next visible change. A
+`Release-As` footer (below) is the exception — it always makes the notes, whatever
+the commit's type. A commit release-please cannot parse as conventional is ignored
+outright.
 
 Below 1.0.0 a breaking change bumps the minor version (`bump-minor-pre-major` in
 `.release-please-config.json`), so the jump to 1.0.0 stays a deliberate act rather
@@ -75,23 +75,83 @@ git commit --allow-empty -m "chore: release 1.0.0" -m "Release-As: 1.0.0"
 
 The same trick forces any other version, e.g. to skip a number.
 
+### The type sets the bump, not the scope
+
+A scope does not soften a type. `feat(examples): …` cuts a minor release of the
+library and `fix(benchmarks): …` a patch, although neither directory ships in the
+sdist or the wheel — PyPI users get a new version number with nothing new in it.
+Pick the type by what reaches a `pip install`:
+
+| The change is to | Use |
+| --- | --- |
+| `lancedb_ray/`, or published metadata (dependencies, extras, `README.md` as the PyPI page) | `feat:`, `fix:`, `perf:`, `refactor:`, `deps:` |
+| user-facing docs or `examples/` | `docs:` — a patch, listed under Documentation |
+| `tests/`, `benchmarks/`, CI, tooling, maintainer docs such as this file | `test:`, `ci:`, `build:`, `chore:` — hidden, no release of their own |
+
+release-please's `exclude-paths` option looks like a way to enforce this
+mechanically. It is deliberately not used: it drops every commit whose files all
+sit under an excluded directory, and an empty commit has no files, so it would
+drop the `Release-As` commit above too. It also cannot see a PR that touches an
+example *and* `README.md`, which is most of them.
+
 ### Squash-merge PRs
 
 release-please reads the commit that lands on `main`. With squash merges that is
 the PR title, so the title is what has to be conventional — one reviewable message
 per change instead of whatever the branch's intermediate commits happened to say.
 
+A merge commit undoes this: release-please then reads every commit on the branch,
+so one `feat(benchmarks):` among a `fix(io):` PR's commits turns a patch release
+into a minor one. Read the title in GitHub's squash box before confirming — it is
+the changelog line.
+
+**A merged title was wrong.** Edit the *merged* PR's description and add
+
+```
+BEGIN_COMMIT_OVERRIDE
+fix(io): the message release-please should have read
+END_COMMIT_OVERRIDE
+```
+
+then re-run the most recent `Release` run from the Actions tab (or push anything
+to `main`). release-please uses the override in place of the squash commit's
+message and rewrites the open release PR to match. This only works for squash
+merges. Do it before merging the release PR; afterwards the version is spent.
+
 ### Where the version lives at runtime
 
 `pyproject.toml` is the only place the number is written. `lancedb_ray.__version__`
 reads it back from the installed distribution metadata, so the two cannot drift.
-Between releases `main` carries the placeholder `0.0.0`; an uninstalled source
-checkout reports `0.0.0.dev0`.
+`main` carries the version of the latest release — only a release PR moves it — and
+an uninstalled source checkout reports `0.0.0.dev0`.
+
+## Cutting a release
+
+0.1.0 was the first, on 2026-09-23. Every release since works the same way:
+
+1. **Squash-merge** changes into `main` with a conventional title whose type matches
+   what ships ([above](#the-type-sets-the-bump-not-the-scope)).
+2. The `Release` workflow opens or updates **`chore(main): release X.Y.Z`** within a
+   minute or two. Check the version it chose and read its `CHANGELOG.md` diff. A
+   version higher than the changes warrant means a title was wrong — fix it with an
+   override (above), not by editing the number. Push wording edits to the release
+   PR's own branch.
+3. Batch as much as you like first: the PR recomputes on every push to `main`, and
+   nothing ships until it is merged.
+4. Merge it (squash). Watch the `Release` run: `release-please` → `verify` (the full
+   CI suite against the tag) → `publish`. If the `pypi` environment has required
+   reviewers, approve the deployment when Actions prompts.
+5. Check <https://pypi.org/project/lancedb-ray/> shows the new version.
+
+If anything after step 4 fails, see [When something goes
+wrong](#when-something-goes-wrong).
 
 ## First-time setup
 
 Four things have to be clicked by a human. The workflows cannot create any of
 them, and until all four exist the release either never starts or never uploads.
+All four were done for 0.1.0; they are recorded here for when one has to be redone,
+e.g. after the repository or workflow is renamed.
 
 ### 1. Let Actions open pull requests
 
@@ -134,14 +194,16 @@ This is [Trusted Publishing](https://docs.pypi.org/trusted-publishers/): the
 workflow exchanges a short-lived OIDC token for an upload token on each run. There
 is no API token to store in repository secrets, so there is none to leak or rotate.
 
-The project does not exist on PyPI yet, so it is registered as a *pending*
-publisher, which becomes a normal one the moment the first upload creates the
-project.
+The project did not exist on PyPI before 0.1.0, so it was registered as a
+*pending* publisher, which the first upload turned into a normal one. Now that the
+project exists, a publisher is managed on the project itself, not the account-wide
+pending form:
 
 1. Sign in at <https://pypi.org> (a PyPI account requires 2FA; set that up first
    if you have not).
-2. Go to <https://pypi.org/manage/account/publishing/>.
-3. Under **Add a new pending publisher**, choose the **GitHub** tab and fill in:
+2. Go to <https://pypi.org/manage/project/lancedb-ray/settings/publishing/>.
+3. Under **Add a new publisher**, choose the **GitHub** tab and fill in the fields
+   below (the project form has no project-name field; the project is implied):
 
    | Field | Value |
    | --- | --- |
@@ -151,35 +213,11 @@ project.
    | Workflow name | `release.yml` |
    | Environment name | `pypi` |
 
-4. Click **Add**.
+4. Click **Add**, then remove the publisher it replaces.
 
 Every field is matched exactly against the OIDC claims at upload time. `release.yml`
 is the file name only, not a path and not the workflow's display name. If you
 renamed the environment in step 3, that name has to match here too.
-
-A pending publisher does **not** reserve the name. If anyone else registers
-`lancedb-ray` on PyPI before the first upload lands, the pending publisher is
-invalidated and the project needs a different name. Add it when you are ready to
-cut the first release, and cut it promptly.
-
-## Cutting the first release
-
-With the four settings in place, merge this branch to `main`. Then:
-
-1. The `Release` workflow runs and opens **`chore(main): release 0.1.0`**. It is
-   `0.1.0` and not `0.0.1` because `pyproject.toml` and
-   `.release-please-manifest.json` start at the placeholder `0.0.0`, and the
-   history contains `feat:` commits.
-2. Read the generated `CHANGELOG.md` in that PR. This first one covers the whole
-   history, so it is the one worth editing by hand if anything reads badly — push
-   edits straight to the release PR's own branch.
-3. Merge it. Watch the `Release` run: `release-please` → `verify` (the full CI
-   suite against the tag) → `publish`.
-4. If you set required reviewers on the `pypi` environment, approve the deployment
-   when Actions prompts.
-5. `pip install lancedb-ray` now resolves.
-
-After that, releasing is merging the PR that release-please keeps open.
 
 ## Rehearsing against TestPyPI
 
@@ -210,7 +248,7 @@ depends on where the fault is, because re-running a job re-tests and rebuilds th
 
 - *The fault is outside the tagged code* — a lost runner, a network or PyPI outage,
   a benchmark tripping on a noisy runner, or a trusted-publisher field that does
-  not match (the most likely failure on the very first release). Fix the outside
+  not match (see the last entry below). Fix the outside
   cause if there is one, then *Re-run failed jobs* from the Actions run page.
   Re-running `publish` is safe wherever it stopped: attaching to the GitHub
   release overwrites, and the PyPI step skips files an earlier attempt already
@@ -229,8 +267,10 @@ Nothing was uploaded. This is a fault in the tagged code, so treat it as above:
 do not re-run, fix forward. The next release PR rewrites the `version` line
 whatever it currently says.
 
-**A release PR you did not want** — typically one opened only by `chore:` and
-`ci:` commits. Close it *and* add the label `autorelease: snooze`. release-please
+**A release PR you did not want** — typically one opened by a lone `docs:` commit
+you would rather ship with the next fix. You can simply leave it open: it keeps
+accumulating, and nothing ships until it is merged. To get it out of the way,
+close it *and* add the label `autorelease: snooze`. release-please
 then leaves it closed until a commit changes the release notes, at which point it
 reopens the same PR with the new notes and drops the label. A plain close without the label achieves
 nothing: the next push to `main` opens a fresh PR with the same contents.

@@ -59,9 +59,11 @@ feat!: drop the deprecated positional uri argument
 
 `fix:` produces a patch release, `feat:` a minor one, and a `!` or a
 `BREAKING CHANGE:` footer marks a breaking change. `test:`, `style:`, `ci:`,
-`build:` and `chore:` produce a patch release too, but are kept out of the
-changelog. PRs are squash-merged, so it is the **PR title** that has to be
-conventional.
+`build:` and `chore:` are kept out of the changelog and never cut a release on
+their own. Choose the type by what ships: a scope does not soften it, so
+`feat(examples):` still cuts a minor release of the library — use `docs:` for
+examples and `chore:`/`test:` for benchmarks and tooling. PRs are squash-merged,
+so it is the **PR title** that has to be conventional.
 
 Do not edit `version` in `pyproject.toml` or `CHANGELOG.md`; release-please owns
 both. [RELEASING.md](RELEASING.md) has the full process.
