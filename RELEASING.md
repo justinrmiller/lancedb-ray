@@ -47,7 +47,7 @@ before anything is published. If you want CI on the release PR anyway, give the
 | `fix: …` | patch (`0.3.1` → `0.3.2`) | Bug Fixes |
 | `feat: …` | minor (`0.3.1` → `0.4.0`) | Features |
 | `perf:`, `refactor:`, `docs:`, `deps:`, `revert:` | patch | own section |
-| `feat!: …`, or a `BREAKING CHANGE:` footer | minor while below 1.0.0, major after | ⚠ Breaking Changes |
+| `feat!: …`, or a `BREAKING CHANGE:` footer | minor while below 1.0.0, major after | ⚠ BREAKING CHANGES |
 | `test:`, `style:`, `ci:`, `build:`, `chore:` | patch | hidden |
 
 Note the last row: release-please bumps a patch for *any* conventional commit it
@@ -96,7 +96,7 @@ Without it, the `release-please` job fails with a 403 the first time it tries to
 open the release PR.
 
 You do **not** need to switch the radio above it to *Read and write permissions*.
-`release.yml` requests `contents: write` and `pull-requests: write` per job, which
+`release.yml` requests `contents`, `pull-requests` and `issues` write per job, which
 works with the safer read-only default.
 
 ### 2. Turn on squash merging
@@ -160,7 +160,7 @@ With the four settings in place, merge this branch to `main`. Then:
    history contains `feat:` commits.
 2. Read the generated `CHANGELOG.md` in that PR. This first one covers the whole
    history, so it is the one worth editing by hand if anything reads badly — push
-   edits straight to the `release-please--branches--main` branch.
+   edits straight to the release PR's own branch.
 3. Merge it. Watch the `Release` run: `release-please` → `verify` (the full CI
    suite against the tag) → `publish`.
 4. If you set required reviewers on the `pypi` environment, approve the deployment
@@ -191,19 +191,28 @@ ones via `Release-As`.
 
 ## When something goes wrong
 
-**`verify` or `publish` failed, so the tag exists but PyPI has nothing.** Nothing
-is lost: no version number has been spent, because spending one requires a
-successful upload. Fix the cause on `main`, then re-run the failed jobs from the
-Actions run page — `publish` checks out the tag, so it does not matter that `main`
-has moved on. If the fix changed code that ships, prefer deleting the tag and the
-GitHub release and letting the next release PR cut a fresh version, so the tag and
-the uploaded artifact describe the same tree.
+**`verify` or `publish` failed, so the tag exists but PyPI has nothing.** No
+version number has been spent: spending one takes a successful upload. What to do
+depends on where the fault is, because re-running a job re-tests and rebuilds the
+*same tagged commit* — it never picks up anything pushed to `main` since.
 
-**The version guard failed** (`tag vX.Y.Z carries version X.Y.Z, but the build
-produced …`). `pyproject.toml` on the tagged commit does not hold the version the
-tag claims — almost always a merge that clobbered release-please's edit. Nothing
-was uploaded. Fix `pyproject.toml` on `main` and cut a new release; do not re-run
-`publish` against the bad tag.
+- *The fault is outside the tagged code* — a lost runner, a network or PyPI outage,
+  a benchmark tripping on a noisy runner, or a trusted-publisher field that does
+  not match (the most likely failure on the very first release). Fix the outside
+  cause if there is one, then *Re-run failed jobs* from the Actions run page.
+- *The fault is in the tagged code* — `verify` found a real bug. Re-running cannot
+  help. Leave the tag and the GitHub release where they are (release-please reads
+  them to work out what has shipped; deleting them confuses its next run), edit
+  the release notes to say the version was never published, and fix forward with
+  a `fix:` commit. The next release PR cuts the next patch. PyPI does not need
+  version numbers to be contiguous, so the skipped one costs nothing.
+
+**The version guard failed** (`release vX.Y.Z is version 'X.Y.Z', but the build
+produced …`). `pyproject.toml` on the tagged commit does not hold the version
+release-please says it released — almost always a merge that clobbered its edit.
+Nothing was uploaded. This is a fault in the tagged code, so treat it as above:
+do not re-run, fix forward. The next release PR rewrites the `version` line
+whatever it currently says.
 
 **A release PR you did not want.** Close it. It reopens on the next push to `main`
 with the same accumulated changelog, so closing costs nothing.

@@ -8,6 +8,12 @@ on:
   # The release workflow re-runs this whole suite against the tagged commit
   # before anything is uploaded to PyPI.
   workflow_call:
+    inputs:
+      ref:
+        description: Commit, branch or tag to test. Empty means the event's own.
+        type: string
+        required: false
+        default: ""
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -23,6 +29,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
@@ -47,6 +55,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
@@ -67,6 +77,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
@@ -97,6 +109,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true

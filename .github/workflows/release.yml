@@ -23,9 +23,14 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+      # release-please finds a merged release PR by its `autorelease: pending`
+      # label, and labels live in the Issues API. If labelling fails, the
+      # merged PR is never found, so it is never tagged or released.
+      issues: write
     outputs:
       release_created: ${{ steps.release.outputs.release_created }}
       tag_name: ${{ steps.release.outputs.tag_name }}
+      version: ${{ steps.release.outputs.version }}
     steps:
       - uses: googleapis/release-please-action@v4
         id: release
@@ -35,12 +40,17 @@ jobs:
 
   # A PyPI upload cannot be replaced or re-cut, so "CI was green on the
   # release PR" is not enough: run the whole suite again on the tagged commit.
+  # The ref is passed explicitly because the run that creates the tag is not
+  # always the run for the commit it tags: a run left pending when a newer
+  # push arrives is cancelled, and the next run tags the earlier merge.
   verify:
     needs: release-please
     if: needs.release-please.outputs.release_created == 'true'
     permissions:
       contents: read
     uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ needs.release-please.outputs.tag_name }}
 
   publish:
     needs: [release-please, verify]
@@ -59,26 +69,33 @@ jobs:
         with:
           ref: ${{ needs.release-please.outputs.tag_name }}
           persist-credentials: false
+      # No cache here, deliberately. This job's output is signed and uploaded,
+      # so it must not restore anything another run wrote: a poisoned build
+      # backend in the cache would end up inside the published wheel. The
+      # default is "auto", which caches, so it has to be switched off by name.
       - uses: astral-sh/setup-uv@v5
         with:
-          enable-cache: true
+          enable-cache: false
       - name: Build sdist and wheel
         run: uv build
       - name: Check the distribution metadata
         run: uvx twine check --strict dist/*
       # If a bad merge ever dropped release-please's edit to pyproject.toml,
-      # this would otherwise upload the 0.0.0 placeholder under the vX.Y.Z tag
-      # and burn that version number on PyPI permanently.
-      - name: Check the built version matches the tag
+      # this would otherwise upload the 0.0.0 placeholder under the release's
+      # tag and burn that version number on PyPI permanently. Compares against
+      # release-please's bare version output, not a parse of the tag name, so
+      # it does not depend on how tags are formatted.
+      - name: Check the built version matches the release
         env:
+          EXPECTED: ${{ needs.release-please.outputs.version }}
           TAG: ${{ needs.release-please.outputs.tag_name }}
         run: |
           built="$(basename dist/*.whl | cut -d- -f2)"
-          if [ "$built" != "${TAG#v}" ]; then
-            echo "tag $TAG carries version ${TAG#v}, but the build produced $built"
+          if [ -z "$EXPECTED" ] || [ "$built" != "$EXPECTED" ]; then
+            echo "release $TAG is version '$EXPECTED', but the build produced '$built'"
             exit 1
           fi
-          echo "built $built from $TAG"
+          echo "built $built for $TAG"
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
       - name: Attach the artifacts to the GitHub release
