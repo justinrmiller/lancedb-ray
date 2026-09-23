@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.1](https://github.com/justinrmiller/lancedb-ray/compare/v0.1.0...v0.1.1) (2026-09-23)
+
+
+### Bug Fixes
+
+* **io:** size the upsert key shuffle by the transaction budget ([#6](https://github.com/justinrmiller/lancedb-ray/issues/6)) ([72d0a6c](https://github.com/justinrmiller/lancedb-ray/commit/72d0a6cd7f98448af302aeb6b94f75c959fd6c25))
+
 ## 0.1.0 (2026-09-23)
 
 
