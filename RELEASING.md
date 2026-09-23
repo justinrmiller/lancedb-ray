@@ -40,6 +40,13 @@ own PR — and because `verify` re-runs the whole suite against the tagged commi
 before anything is published. If you want CI on the release PR anyway, give the
 `release-please` job a PAT or GitHub App token instead of `GITHUB_TOKEN`.
 
+This turns into a hard block if you protect `main` with **required status
+checks**: a check that never runs never reports, so the release PR sits at
+*Expected — Waiting for status to be reported* and cannot be merged. `main` is
+unprotected today. If you protect it later, do one of: leave the CI checks
+unrequired, allow administrators to bypass the rule, or switch release-please
+to a GitHub App token so its PRs get CI like any other.
+
 ## What each commit type does to the version
 
 | Commit | Bump | In the changelog |
@@ -150,6 +157,11 @@ Every field is matched exactly against the OIDC claims at upload time. `release.
 is the file name only, not a path and not the workflow's display name. If you
 renamed the environment in step 3, that name has to match here too.
 
+A pending publisher does **not** reserve the name. If anyone else registers
+`lancedb-ray` on PyPI before the first upload lands, the pending publisher is
+invalidated and the project needs a different name. Add it when you are ready to
+cut the first release, and cut it promptly.
+
 ## Cutting the first release
 
 With the four settings in place, merge this branch to `main`. Then:
@@ -200,6 +212,9 @@ depends on where the fault is, because re-running a job re-tests and rebuilds th
   a benchmark tripping on a noisy runner, or a trusted-publisher field that does
   not match (the most likely failure on the very first release). Fix the outside
   cause if there is one, then *Re-run failed jobs* from the Actions run page.
+  Re-running `publish` is safe wherever it stopped: attaching to the GitHub
+  release overwrites, and the PyPI step skips files an earlier attempt already
+  uploaded.
 - *The fault is in the tagged code* — `verify` found a real bug. Re-running cannot
   help. Leave the tag and the GitHub release where they are (release-please reads
   them to work out what has shipped; deleting them confuses its next run), edit
@@ -214,8 +229,11 @@ Nothing was uploaded. This is a fault in the tagged code, so treat it as above:
 do not re-run, fix forward. The next release PR rewrites the `version` line
 whatever it currently says.
 
-**A release PR you did not want.** Close it. It reopens on the next push to `main`
-with the same accumulated changelog, so closing costs nothing.
+**A release PR you did not want** — typically one opened only by `chore:` and
+`ci:` commits. Close it *and* add the label `autorelease: snooze`. release-please
+then leaves it closed until a commit changes the release notes, at which point it
+reopens the same PR with the new notes and drops the label. A plain close without the label achieves
+nothing: the next push to `main` opens a fresh PR with the same contents.
 
 **Something wrong was published.** A version number on PyPI is spent permanently;
 deleting a release does not free it. Fix forward with a `fix:` commit and let the

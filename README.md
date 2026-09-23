@@ -109,14 +109,14 @@ Requires Python 3.12 or newer. CI tests against 3.12.
 ## Examples
 
 Each example lives in its own directory with a README of its own — see
-[`examples/`](examples/).
+[`examples/`](https://github.com/justinrmiller/lancedb-ray/tree/main/examples).
 
 | Example | What it shows |
 | --- | --- |
-| [`quickstart/`](examples/quickstart/) | The core guarantees on synthetic data: a write fans out across Ray tasks yet lands as one atomic commit, and reads come back fragment-parallel. No extra dependencies. |
-| [`clip_image_search/`](examples/clip_image_search/) | A realistic pipeline — scan a directory of JPGs, embed them with CLIP across Ray, write to LanceDB, build a vector index, then search them in plain English from a Streamlit app. |
-| [`vllm_generate_embed/`](examples/vllm_generate_embed/) | An LLM pipeline — answer prompts with vLLM (or a small local model), embed each answer, write them to LanceDB, then search what the model said by meaning from a Streamlit app. |
-| [`object_storage/`](examples/object_storage/) | Verify writes to S3-compatible object storage — a Floci emulator in Docker Compose plus a large locally generated dataset, asserting the round trip and the single atomic commit. |
+| [`quickstart/`](https://github.com/justinrmiller/lancedb-ray/tree/main/examples/quickstart) | The core guarantees on synthetic data: a write fans out across Ray tasks yet lands as one atomic commit, and reads come back fragment-parallel. No extra dependencies. |
+| [`clip_image_search/`](https://github.com/justinrmiller/lancedb-ray/tree/main/examples/clip_image_search) | A realistic pipeline — scan a directory of JPGs, embed them with CLIP across Ray, write to LanceDB, build a vector index, then search them in plain English from a Streamlit app. |
+| [`vllm_generate_embed/`](https://github.com/justinrmiller/lancedb-ray/tree/main/examples/vllm_generate_embed) | An LLM pipeline — answer prompts with vLLM (or a small local model), embed each answer, write them to LanceDB, then search what the model said by meaning from a Streamlit app. |
+| [`object_storage/`](https://github.com/justinrmiller/lancedb-ray/tree/main/examples/object_storage) | Verify writes to S3-compatible object storage — a Floci emulator in Docker Compose plus a large locally generated dataset, asserting the round trip and the single atomic commit. |
 
 ## Two traps this library avoids
 
@@ -271,7 +271,7 @@ LANCEDB_URI=db://your-db LANCEDB_API_KEY=... pytest -m enterprise
 Commit messages follow [Conventional Commits](https://www.conventionalcommits.org/):
 `fix:` cuts a patch release, `feat:` a minor one, and the version in
 `pyproject.toml` is written by automation rather than by hand. See
-[RELEASING.md](RELEASING.md).
+[RELEASING.md](https://github.com/justinrmiller/lancedb-ray/blob/main/RELEASING.md).
 
 ## License
 

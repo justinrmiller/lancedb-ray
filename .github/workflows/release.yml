@@ -96,8 +96,10 @@ jobs:
             exit 1
           fi
           echo "built $built for $TAG"
-      - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+      # Attach before uploading to PyPI, so the one step that cannot be undone
+      # runs last. The other way round, a failure here would leave the version
+      # on PyPI, and re-running the job would then die at the PyPI step on
+      # "file already exists" before ever getting back to this one.
       - name: Attach the artifacts to the GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -105,3 +107,11 @@ jobs:
           # the repository from the remote.
           GH_REPO: ${{ github.repository }}
         run: gh release upload "${{ needs.release-please.outputs.tag_name }}" dist/* --clobber
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          # Makes a re-run safe after an upload that stopped halfway (wheel
+          # accepted, sdist not): files already on PyPI are skipped instead of
+          # failing the job. Only this workflow can publish, so anything already
+          # there came from an earlier attempt at this same release.
+          skip-existing: true
