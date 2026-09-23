@@ -15,7 +15,7 @@ from typing import Any
 from .. import datagen
 from ..checks import compare_tables, id_stats, sample_ids, verify_id_space
 from ..harness import BenchRun
-from . import register
+from . import ALL_TIERS, register
 from ._common import TABLE, expected_bytes, read_back, seed
 
 _STRATEGIES = ("offsets", "pagination", "single")
@@ -26,7 +26,7 @@ _STRATEGIES = ("offsets", "pagination", "single")
     group="remote",
     description="offsets vs pagination vs single for a remote read",
     backends=("fake",),
-    tiers=("smoke", "ci", "local", "full"),
+    tiers=ALL_TIERS,
 )
 def remote_read_strategies(run: BenchRun, backend: str) -> None:
     dataset = "narrow"
@@ -97,7 +97,7 @@ def remote_read_strategies(run: BenchRun, backend: str) -> None:
     group="remote",
     description="batch_size trades round trips against request size",
     backends=("fake",),
-    tiers=("smoke", "ci", "local", "full"),
+    tiers=ALL_TIERS,
 )
 def remote_batch_size(run: BenchRun, backend: str) -> None:
     dataset = "narrow"

@@ -11,6 +11,7 @@ transformers>=4.40,<5
 streamlit>=1.30
 
 # --engine vllm additionally needs Ray's LLM extra and vLLM itself:
-#   uv pip install "ray[llm]" vllm
+#   uv pip install "ray[llm]>=2.53" vllm
+# 2.53 is where ray.data.llm gained build_processor, which generate.py uses.
 # vLLM picks a CPU backend when no CUDA device is present, which is slow but
 # works -- the example was verified that way on Apple silicon.

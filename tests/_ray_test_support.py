@@ -22,6 +22,10 @@ def patch_memory_profiler() -> None:
         from ray.data._internal import util as ray_data_util
     except ImportError:
         return
+    if not hasattr(ray_data_util, "MemoryProfiler"):
+        # Older Ray Data (2.41, for one) has no MemoryProfiler at all, so
+        # there is nothing to harden.
+        return
 
     original_init = ray_data_util.MemoryProfiler.__init__
 

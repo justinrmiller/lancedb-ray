@@ -1,0 +1,117 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+# Read-only by default; every job asks for exactly the scopes it needs.
+permissions: {}
+
+# Never let two releases interleave, and never cancel one mid-flight: a
+# half-finished release leaves a tag with nothing on PyPI behind it.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  # Keeps a release PR open that bumps the version and rewrites CHANGELOG.md
+  # from the Conventional Commits landed since the last tag. Merging that PR
+  # is the release: this job then tags the merge commit and cuts the GitHub
+  # release, and the jobs below publish it.
+  release-please:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      # release-please finds a merged release PR by its `autorelease: pending`
+      # label, and labels live in the Issues API. If labelling fails, the
+      # merged PR is never found, so it is never tagged or released.
+      issues: write
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: release
+        with:
+          config-file: .release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  # A PyPI upload cannot be replaced or re-cut, so "CI was green on the
+  # release PR" is not enough: run the whole suite again on the tagged commit.
+  # The ref is passed explicitly because the run that creates the tag is not
+  # always the run for the commit it tags: a run left pending when a newer
+  # push arrives is cancelled, and the next run tags the earlier merge.
+  verify:
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ needs.release-please.outputs.tag_name }}
+
+  publish:
+    needs: [release-please, verify]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/lancedb-ray
+    permissions:
+      # PyPI Trusted Publishing mints a short-lived OIDC token per run, so
+      # there is no long-lived API token to store or rotate.
+      id-token: write
+      # Attaching the built artifacts to the GitHub release.
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release-please.outputs.tag_name }}
+          persist-credentials: false
+      # No cache here, deliberately. This job's output is signed and uploaded,
+      # so it must not restore anything another run wrote: a poisoned build
+      # backend in the cache would end up inside the published wheel. The
+      # default is "auto", which caches, so it has to be switched off by name.
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: false
+      - name: Build sdist and wheel
+        run: uv build
+      - name: Check the distribution metadata
+        run: uvx twine check --strict dist/*
+      # If a bad merge ever dropped release-please's edit to pyproject.toml,
+      # this would otherwise upload the 0.0.0 placeholder under the release's
+      # tag and burn that version number on PyPI permanently. Compares against
+      # release-please's bare version output, not a parse of the tag name, so
+      # it does not depend on how tags are formatted.
+      - name: Check the built version matches the release
+        env:
+          EXPECTED: ${{ needs.release-please.outputs.version }}
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+        run: |
+          built="$(basename dist/*.whl | cut -d- -f2)"
+          if [ -z "$EXPECTED" ] || [ "$built" != "$EXPECTED" ]; then
+            echo "release $TAG is version '$EXPECTED', but the build produced '$built'"
+            exit 1
+          fi
+          echo "built $built for $TAG"
+      # Attach before uploading to PyPI, so the one step that cannot be undone
+      # runs last. The other way round, a failure here would leave the version
+      # on PyPI, and re-running the job would then die at the PyPI step on
+      # "file already exists" before ever getting back to this one.
+      - name: Attach the artifacts to the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # checkout ran with persist-credentials: false, so gh cannot infer
+          # the repository from the remote.
+          GH_REPO: ${{ github.repository }}
+        run: gh release upload "${{ needs.release-please.outputs.tag_name }}" dist/* --clobber
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          # Makes a re-run safe after an upload that stopped halfway (wheel
+          # accepted, sdist not): files already on PyPI are skipped instead of
+          # failing the job. Only this workflow can publish, so anything already
+          # there came from an earlier attempt at this same release.
+          skip-existing: true

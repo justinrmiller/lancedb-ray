@@ -10,7 +10,7 @@ import pyarrow as pa
 from .. import datagen
 from ..checks import id_stats, read_rows, verify_id_space
 from ..harness import BenchRun
-from . import register
+from . import ALL_TIERS, register
 from ._common import TABLE, collect_counters, expected_bytes, read_back, seed
 
 #: Marks a row as having come from the upsert rather than the original write,
@@ -122,7 +122,7 @@ def upsert_merge(run: BenchRun, backend: str) -> None:
     group="upsert",
     description="A repeated key is rejected, not silently written twice",
     backends=("local", "fake", "s3"),
-    tiers=("smoke", "ci", "local", "full"),
+    tiers=ALL_TIERS,
 )
 def upsert_duplicate_keys(run: BenchRun, backend: str) -> None:
     """The trap the key-partitioning shuffle exists to close.
@@ -192,7 +192,7 @@ def upsert_duplicate_keys(run: BenchRun, backend: str) -> None:
     group="upsert",
     description="Replaying the same upsert converges on the same table",
     backends=("local", "fake", "s3"),
-    tiers=("smoke", "ci", "local", "full"),
+    tiers=ALL_TIERS,
 )
 def upsert_idempotency(run: BenchRun, backend: str) -> None:
     """The basis of the exactly-once claim: merge-insert is idempotent.

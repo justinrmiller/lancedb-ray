@@ -29,10 +29,16 @@ __all__ = [
 #: "remote" backend. Kept in sync with ``tests/_fakes.FAKE_REMOTE_PREFIX``.
 _FAKE_PREFIX = "db://fake"
 
-_SUFFIX = {"": 1.0, "K": 1e3, "M": 1e6, "G": 1e9, "T": 1e12}
+# Lance formats plan metrics with a *count* suffix -- K/M/B/T for thousand,
+# million, billion, trillion -- and never a byte unit: 39,870 bytes prints as
+# "39.87 K", not "39.87 KB". ``B`` therefore means billion, which is why it
+# multiplies rather than being read as "bytes". ``G`` is kept only in case a
+# future release switches to a byte formatter. Values below a thousand print
+# bare ("rows_scanned=100"), so a lone letter is always a magnitude.
+_SUFFIX = {"": 1.0, "K": 1e3, "M": 1e6, "B": 1e9, "G": 1e9, "T": 1e12}
 
 _METRIC_RE = re.compile(
-    r"(?P<key>[a-z_]+)=(?P<value>-?\d+(?:\.\d+)?)\s*(?P<suffix>[KMGT])?\s*(?P<unit>B\b)?"
+    r"(?P<key>[a-z_]+)=(?P<value>-?\d+(?:\.\d+)?)\s*(?P<suffix>[KMGBT])?\s*(?P<unit>B\b)?"
 )
 
 #: The metrics worth asserting on. Everything else in the plan output is timing.
