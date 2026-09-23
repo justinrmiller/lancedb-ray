@@ -1,0 +1,11 @@
+# Extra dependency for the MCAP example.
+# Install with:  uv pip install -r examples/mcap_ingest/requirements.txt
+#
+# Pure Python, plus its compression codecs (lz4, zstandard). It is also in the
+# project's [dev] extra, so `make build` already provides it.
+mcap>=1.2.0
+
+# Not needed by this example, which stores every payload as bytes and decodes
+# only JSON. Add one of these to decode real robot logs -- see the README:
+#   mcap-ros2-support
+#   mcap-protobuf-support

@@ -20,6 +20,15 @@ _TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 if _TESTS_DIR not in sys.path:
     sys.path.insert(0, _TESTS_DIR)
 
+# Example modules under test are imported flat, the same way a Ray worker
+# loads them, so their directories go on the path too. Module names across
+# examples are kept globally unique for exactly this reason.
+_REPO_ROOT = os.path.dirname(_TESTS_DIR)
+_EXAMPLE_DIRS = [os.path.join(_REPO_ROOT, "examples", "mcap_ingest")]
+for _example_dir in _EXAMPLE_DIRS:
+    if _example_dir not in sys.path:
+        sys.path.insert(0, _example_dir)
+
 import lancedb_ray  # noqa: E402
 from lancedb_ray.connection import clear_connection_cache  # noqa: E402
 
@@ -52,7 +61,11 @@ def ray_context() -> Iterator[None]:
     runtime_env = {
         "worker_process_setup_hook": "_ray_test_support.setup_worker",
         "env_vars": {
-            "PYTHONPATH": _TESTS_DIR + os.pathsep + os.environ.get("PYTHONPATH", ""),
+            # Workers import both the test helpers and the example modules
+            # under test; neither is installed, so both go on their path.
+            "PYTHONPATH": os.pathsep.join(
+                [_TESTS_DIR, *_EXAMPLE_DIRS, os.environ.get("PYTHONPATH", "")]
+            ),
             "RAY_ENABLE_UV_RUN_RUNTIME_ENV": "0",
         },
     }
