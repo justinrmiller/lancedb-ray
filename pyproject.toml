@@ -10,7 +10,7 @@ build-backend = "setuptools.build_meta"
 name = "lancedb-ray"
 # Managed by release-please: the release PR rewrites this line and the
 # matching entry in .release-please-manifest.json. Do not bump it by hand.
-version = "0.0.0"
+version = "0.1.0"
 description = "Ray Data integration for LanceDB and LanceDB Enterprise"
 readme = "README.md"
 requires-python = ">=3.12"
